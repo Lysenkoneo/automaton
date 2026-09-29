@@ -156,31 +156,38 @@ function resolveAndValidatePath(filePath: string): string | null {
  * Check if a file path is protected from modification.
  */
 export function isProtectedFile(filePath: string): boolean {
-  const resolved = path.resolve(filePath);
+  const normalized = filePath.replace(/\\/g, "/").replace(/\/+/g, "/");
 
   // Check against protected file patterns using path-segment matching
   for (const pattern of PROTECTED_FILES) {
-    const patternResolved = path.resolve(pattern);
-    // Exact match on resolved paths
-    if (resolved === patternResolved) return true;
-    // Match by path suffix: the resolved path ends with /pattern
-    if (resolved.endsWith(path.sep + pattern)) return true;
-    // Also check multi-segment patterns (e.g., "self-mod/code.ts")
-    if (pattern.includes("/") && resolved.endsWith(path.sep + pattern.replace(/\//g, path.sep))) return true;
+    const normalizedPattern = pattern
+      .replace(/\\/g, "/")
+      .replace(/\/+/g, "/");
+
+    if (normalized === normalizedPattern) return true;
+    if (normalized.endsWith("/" + normalizedPattern)) return true;
   }
 
   // Check against blocked directory patterns using path-segment matching
   for (const pattern of BLOCKED_DIRECTORY_PATTERNS) {
-    // Check if any path segment matches the blocked directory
-    if (resolved.includes(path.sep + pattern + path.sep) ||
-        resolved.endsWith(path.sep + pattern) ||
-        resolved === pattern) {
-      return true;
+    const normalizedPattern = pattern
+      .replace(/\\/g, "/")
+      .replace(/\/+/g, "/");
+
+    // Absolute Unix-style blocked paths, e.g. /etc/systemd or /proc
+    if (normalizedPattern.startsWith("/")) {
+      if (
+        normalized === normalizedPattern ||
+        normalized.startsWith(normalizedPattern + "/")
+      ) {
+        return true;
+      }
+      continue;
     }
-    // Handle absolute patterns like /etc/systemd
-    if (pattern.startsWith("/") && resolved.startsWith(pattern)) {
-      return true;
-    }
+
+    // Directory-name matching, e.g. .ssh, .gnupg, .aws
+    const segments = normalized.split("/").filter(Boolean);
+    if (segments.includes(normalizedPattern)) return true;
   }
 
   return false;

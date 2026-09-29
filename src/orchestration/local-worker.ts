@@ -38,6 +38,7 @@ interface LocalWorkerConfig {
   identity: AutomatonIdentity;
   config: AutomatonConfig;
   allowedEditRoot?: string;
+  workspaceBasePath?: string;
   tools?: AutomatonTool[];
   toolContext?: ToolContext;
   policyEngine?: PolicyEngine;
@@ -100,7 +101,12 @@ export class LocalWorkerPool {
 
   private async runWorker(workerId: string, task: TaskNode, signal: AbortSignal): Promise<void> {
     const harness = this.config.harnessRegistry.createForRole(task.agentRole);
-    const workspace = new AgentWorkspace(task.goalId);
+    const workspace = new AgentWorkspace(
+      task.goalId,
+      this.config.workspaceBasePath
+        ? path.join(this.config.workspaceBasePath, task.goalId)
+        : undefined,
+    );
     const allowedEditRoot = path.resolve(this.config.allowedEditRoot ?? DEFAULT_ALLOWED_EDIT_ROOT);
     const workerIdentity = createWorkerIdentity(this.config.identity, workerId, task.agentRole);
     const context: HarnessContext = {

@@ -37,12 +37,22 @@ const SANDBOX_HOME = "/root";
 function confinePathToSandbox(filePath: string): string | { error: string } {
   // Resolve ~ to SANDBOX_HOME
   const expanded = filePath.startsWith("~")
-    ? nodePath.join(SANDBOX_HOME, filePath.slice(1))
+    ? nodePath.posix.join(SANDBOX_HOME, filePath.slice(1))
     : filePath;
-  // Resolve to absolute (relative paths resolve against SANDBOX_HOME)
-  const resolved = nodePath.resolve(SANDBOX_HOME, expanded);
-  // Ensure the resolved path is within the sandbox home
-  if (resolved !== SANDBOX_HOME && !resolved.startsWith(SANDBOX_HOME + "/")) {
+
+  // Resolve relative paths against SANDBOX_HOME.
+  const resolved = nodePath.posix.resolve(SANDBOX_HOME, expanded);
+
+  // Normalize separators for comparison so this works on both
+  // POSIX (/root/...) and Windows (C:\root\...) environments.
+  const normalizedResolved = resolved.replace(/\\/g, "/").replace(/\/+$/, "");
+  const normalizedSandbox = SANDBOX_HOME.replace(/\\/g, "/").replace(/\/+$/, "");
+
+  // Ensure the resolved path is inside the sandbox.
+  const isSandboxRoot = normalizedResolved === normalizedSandbox;
+  const isInsideSandbox = normalizedResolved.startsWith(normalizedSandbox + "/");
+
+  if (!isSandboxRoot && !isInsideSandbox) {
     return {
       error: `Blocked: write_file path "${filePath}" resolves to "${resolved}" which is outside the allowed directory (${SANDBOX_HOME}). Writes are confined to the sandbox home.`,
     };

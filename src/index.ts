@@ -196,11 +196,22 @@ async function run(): Promise<void> {
   // Load wallet (chain-aware)
   const { account, chainIdentity, chainType: walletChainType } = await getWallet();
   const resolvedChainType = config.chainType || walletChainType || "evm";
-  const apiKey = config.conwayApiKey || loadApiKeyFromConfig();
-  if (!apiKey) {
-    logger.error("No API key found. Run: automaton --provision");
-    process.exit(1);
-  }
+const resolvedApiKey = config.conwayApiKey || loadApiKeyFromConfig() || "";
+
+// Ollama can run local inference without a Conway API key.
+// Conway API key remains available when configured for Conway-backed features.
+const ollamaBaseUrl = process.env.OLLAMA_BASE_URL || config.ollamaBaseUrl;
+const usingLocalInference =
+  !!ollamaBaseUrl &&
+  /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(?::\d+)?(?:\/|$)/i.test(
+    ollamaBaseUrl,
+  );
+
+if (!resolvedApiKey && !usingLocalInference) {
+  logger.error("No API key found. Run: automaton --provision");
+  return;
+}
+
 
   // Initialize database
   const dbPath = resolvePath(config.dbPath);
@@ -220,7 +231,7 @@ async function run(): Promise<void> {
     account,
     creatorAddress: config.creatorAddress,
     sandboxId: config.sandboxId,
-    apiKey,
+    apiKey: resolvedApiKey,
     createdAt,
     chainType: resolvedChainType,
     chainIdentity,
@@ -241,7 +252,7 @@ async function run(): Promise<void> {
   // Create Conway client
   const conway = createConwayClient({
     apiUrl: config.conwayApiUrl,
-    apiKey,
+    apiKey: resolvedApiKey,
     sandboxId: config.sandboxId,
   });
 
@@ -277,8 +288,7 @@ async function run(): Promise<void> {
     }
   }
 
-  // Resolve Ollama base URL: env var takes precedence over config
-  const ollamaBaseUrl = process.env.OLLAMA_BASE_URL || config.ollamaBaseUrl;
+ 
 
   // Create inference client — pass a live registry lookup so model names like
   // "gpt-oss:120b" route to Ollama based on their registered provider, not heuristics.
@@ -286,7 +296,7 @@ async function run(): Promise<void> {
   modelRegistry.initialize();
   const inference = createInferenceClient({
     apiUrl: config.conwayApiUrl,
-    apiKey,
+    apiKey: resolvedApiKey,
     defaultModel: config.inferenceModel,
     maxTokens: config.maxTokensPerTurn,
     lowComputeModel: config.modelStrategy?.lowComputeModel || "gpt-5-mini",

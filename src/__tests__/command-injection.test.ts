@@ -12,6 +12,7 @@
  */
 
 import { describe, it, expect } from "vitest";
+import { fileURLToPath } from "node:url";
 import { createDefaultRules } from "../agent/policy-rules/index.js";
 import { createValidationRules } from "../agent/policy-rules/validation.js";
 import { createCommandSafetyRules } from "../agent/policy-rules/command-safety.js";
@@ -558,7 +559,7 @@ describe("Source code injection safety", () => {
   it("upstream.ts uses execFileSync not execSync with string interpolation", async () => {
     const fs = await import("fs");
     const source = fs.readFileSync(
-      new URL("../self-mod/upstream.ts", import.meta.url).pathname.replace("/src/__tests__/../", "/src/"),
+      fileURLToPath(new URL("../self-mod/upstream.ts", import.meta.url)),
       "utf-8",
     );
     // Should NOT have: execSync(`git ${cmd}`)
@@ -570,7 +571,7 @@ describe("Source code injection safety", () => {
   it("registry.ts uses execFileSync not conway.exec with interpolation", async () => {
     const fs = await import("fs");
     const source = fs.readFileSync(
-      new URL("../skills/registry.ts", import.meta.url).pathname.replace("/src/__tests__/../", "/src/"),
+      fileURLToPath(new URL("../skills/registry.ts", import.meta.url)),
       "utf-8",
     );
     // Should NOT have template literals in conway.exec calls
@@ -584,7 +585,7 @@ describe("Source code injection safety", () => {
   it("loader.ts uses execFileSync('which', [bin]) not execSync('which ${bin}')", async () => {
     const fs = await import("fs");
     const source = fs.readFileSync(
-      new URL("../skills/loader.ts", import.meta.url).pathname.replace("/src/__tests__/../", "/src/"),
+      fileURLToPath(new URL("../skills/loader.ts", import.meta.url)),
       "utf-8",
     );
     // Should NOT have: execSync(`which ${bin}`)
@@ -596,7 +597,7 @@ describe("Source code injection safety", () => {
   it("tools.ts pull_upstream uses conway.exec not host execSync", async () => {
     const fs = await import("fs");
     const source = fs.readFileSync(
-      new URL("../agent/tools.ts", import.meta.url).pathname.replace("/src/__tests__/../", "/src/"),
+      fileURLToPath(new URL("../agent/tools.ts", import.meta.url)),
       "utf-8",
     );
     // Find the pull_upstream section and check it doesn't import child_process
@@ -611,7 +612,7 @@ describe("Source code injection safety", () => {
   it("tools.ts has defense-in-depth comment on FORBIDDEN_COMMAND_PATTERNS", async () => {
     const fs = await import("fs");
     const source = fs.readFileSync(
-      new URL("../agent/tools.ts", import.meta.url).pathname.replace("/src/__tests__/../", "/src/"),
+      fileURLToPath(new URL("../agent/tools.ts", import.meta.url)),
       "utf-8",
     );
     expect(source).toMatch(/[Dd]efense.in.depth.*policy engine/i);
