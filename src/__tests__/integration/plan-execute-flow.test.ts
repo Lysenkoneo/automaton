@@ -1,6 +1,8 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { ulid } from "ulid";
 import type BetterSqlite3 from "better-sqlite3";
+import { assignTask } from "../../orchestration/task-graph.js";
+import { getTaskById } from "../../state/database.js";
 import { Orchestrator } from "../../orchestration/orchestrator.js";
 import { createInMemoryDb } from "../orchestration/test-db.js";
 
@@ -138,7 +140,7 @@ function makeOrchestrator(
   });
 }
 
-function makeTaskResultInboxEntry(goalId: string, taskId: string) {
+function makeTaskResultInboxEntry(goalId: string, taskId: string, attemptId: string) {
   return {
     success: true,
     message: {
@@ -150,6 +152,7 @@ function makeTaskResultInboxEntry(goalId: string, taskId: string) {
       taskId,
       content: JSON.stringify({
         taskId,
+        attemptId,
         result: {
           success: true,
           output: "done",
@@ -279,7 +282,7 @@ describe("integration/plan-execute-flow", () => {
 
       // Second tick: process task result
       mocks.messaging.processInbox.mockResolvedValue([
-        makeTaskResultInboxEntry(goalId, taskId),
+        makeTaskResultInboxEntry(goalId, taskId, getTaskById(db, taskId)!.attemptId!),
       ]);
       const result2 = await orc.tick();
 
@@ -305,6 +308,7 @@ describe("integration/plan-execute-flow", () => {
         { address: "0xchild", name: "Worker", role: "generalist", status: "healthy" },
       ]);
 
+      const attemptId = assignTask(db, taskId, "0xchild");
       // Return a failed task result
       mocks.messaging.processInbox.mockResolvedValue([
         {
@@ -318,6 +322,7 @@ describe("integration/plan-execute-flow", () => {
             taskId,
             content: JSON.stringify({
               taskId,
+              attemptId,
               result: { success: false, output: "error: something broke", artifacts: [], costCents: 10, duration: 50 },
             }),
             priority: "normal",
@@ -373,6 +378,7 @@ describe("integration/plan-execute-flow", () => {
         { address: "0xchild", name: "Worker", role: "generalist", status: "healthy" },
       ]);
 
+      const attemptId = assignTask(db, taskId, "0xchild");
       // Return a failed task result
       mocks.messaging.processInbox.mockResolvedValue([
         {
@@ -386,6 +392,7 @@ describe("integration/plan-execute-flow", () => {
             taskId,
             content: JSON.stringify({
               taskId,
+              attemptId,
               result: { success: false, output: "fatal failure", artifacts: [], costCents: 0, duration: 0 },
             }),
             priority: "normal",

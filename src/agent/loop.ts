@@ -57,7 +57,7 @@ import { createLogger } from "../observability/logger.js";
 import { Orchestrator } from "../orchestration/orchestrator.js";
 import { PlanModeController } from "../orchestration/plan-mode.js";
 import { generateTodoMd, injectTodoContext } from "../orchestration/attention.js";
-import { ColonyMessaging, LocalDBTransport } from "../orchestration/messaging.js";
+import { ColonyMessaging, LocalDBTransport, SocialRelayTransport } from "../orchestration/messaging.js";
 import { LocalWorkerPool } from "../orchestration/local-worker.js";
 import { SimpleAgentTracker, SimpleFundingProtocol } from "../orchestration/simple-tracker.js";
 import { HarnessRegistry } from "./harness-registry.js";
@@ -173,7 +173,7 @@ export async function runAgentLoop(
       const agentTracker = new SimpleAgentTracker(db);
       const funding = new SimpleFundingProtocol(conway, identity, db);
       const messaging = new ColonyMessaging(
-        new LocalDBTransport(db),
+        social ? new SocialRelayTransport(social, () => db.getChildren().map((child) => child.address)) : new LocalDBTransport(db),
         db,
       );
 
@@ -207,9 +207,9 @@ export async function runAgentLoop(
         messaging,
         inference: unifiedInference,
         identity,
-        isWorkerAlive: (address: string) => {
+        isWorkerAlive: (address: string, attemptId?: string) => {
           if (address.startsWith("local://")) {
-            return initializedWorkerPool.hasWorker(address);
+            return initializedWorkerPool.hasWorker(address, attemptId);
           }
           // Remote workers: check children table
           const child = db.raw.prepare(

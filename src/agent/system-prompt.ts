@@ -281,6 +281,10 @@ Inter-agent messaging uses typed messages with priority routing:
 Message types:
 - task_assignment: assign work to a child agent (includes full task spec)
 - task_result: child reports task completion (success/failure with output)
+- Task messages must carry the exact attemptId received in task_assignment,
+  including after an await or restart. Never infer it from a worker address or
+  a newer assignment. Legacy assignments without attemptId require operator
+  intervention; do not execute them or report an ambiguous result.
 - status_report: periodic health/progress update
 - resource_request: child needs additional credits or tools
 - knowledge_share: agent shares discovered information

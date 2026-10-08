@@ -2024,6 +2024,8 @@ Model: ${ctx.inference.getDefaultModel()}
         }
         // Phase 3.2: Enforce MESSAGE_LIMITS size check
         const content = args.content as string;
+        const { validateOutgoingTaskContent } = await import("../orchestration/messaging.js");
+        validateOutgoingTaskContent(content);
         const { MESSAGE_LIMITS } = await import("../types.js");
         if (content.length > MESSAGE_LIMITS.maxContentLength) {
           return `Blocked: Message content too long (${content.length} > ${MESSAGE_LIMITS.maxContentLength} bytes)`;
@@ -3059,8 +3061,8 @@ Model: ${ctx.inference.getDefaultModel()}
     {
       name: "complete_task",
       description:
-        "Mark a task as completed with a result. Use this when YOU (the parent agent) " +
-        "have finished a self-assigned task, or to manually resolve a stuck task.",
+        "Complete your own current task using the attempt_id received with its assignment. " +
+        "Legacy assignments require verified worker neutralization outside this tool.",
       category: "orchestration" as ToolCategory,
       riskLevel: "caution" as RiskLevel,
       parameters: {
@@ -3074,13 +3076,17 @@ Model: ${ctx.inference.getDefaultModel()}
             type: "string",
             description: "Description of what was accomplished",
           },
+          attempt_id: {
+            type: "string",
+            description: "Exact attemptId from the original assignment; never infer it from the latest task",
+          },
           artifacts: {
             type: "string",
             description:
               "Comma-separated list of file paths or URLs created (optional)",
           },
         },
-        required: ["task_id", "output"],
+        required: ["task_id", "attempt_id", "output"],
       },
       execute: async (args, ctx) => {
         const { completeTask } = await import("../orchestration/task-graph.js");
@@ -3104,12 +3110,17 @@ Model: ${ctx.inference.getDefaultModel()}
               `SELECT * FROM task_graph WHERE LOWER(title) LIKE ? AND status != 'completed' LIMIT 1`,
             )
             .get(`%${input.toLowerCase()}%`) as any;
-          if (rows) task = rows;
+          if (rows) task = getTaskById(ctx.db.raw, rows.id);
         }
         if (!task)
           return `Task "${input}" not found. Use list_goals to see tasks with their IDs.`;
         if (task.status === "completed")
           return `Task "${task.title}" is already completed.`;
+        if (!task.attemptId)
+          return "Blocked: task has no attemptId; legacy execution must be neutralized before reassignment.";
+        const attemptId = typeof args.attempt_id === "string" ? args.attempt_id : "";
+        if (!attemptId || attemptId !== task.attemptId || task.assignedTo !== ctx.identity.address)
+          return "Blocked: completion requires your original current assignment and matching attemptId.";
 
         const result = {
           success: true,
@@ -3120,7 +3131,7 @@ Model: ${ctx.inference.getDefaultModel()}
         };
 
         try {
-          completeTask(ctx.db.raw, task.id, result);
+          completeTask(ctx.db.raw, task.id, result, { taskId: task.id, workerAddress: ctx.identity.address, attemptId });
           return `Task "${task.title}" marked as completed.\nOutput: ${output}`;
         } catch (error) {
           return `Failed to complete task: ${error instanceof Error ? error.message : String(error)}`;

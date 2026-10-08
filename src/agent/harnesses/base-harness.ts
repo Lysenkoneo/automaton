@@ -105,6 +105,7 @@ export abstract class BaseHarness implements AgentHarness {
     let finalSuccess = true;
 
     while (true) {
+      this.context.assertActive?.();
       this.checkBudget();
 
       if (this.context.abortSignal.aborted) {
@@ -135,6 +136,7 @@ export abstract class BaseHarness implements AgentHarness {
       }
 
       this.beforeTurn();
+      this.context.assertActive?.();
       this.context.budget.turnsUsed++;
       logger.info(
         `[${this.id}] Turn ${this.context.budget.turnsUsed}/${this.context.budget.maxTurns} — task: ${this.task.title.slice(0, 60)}`,
@@ -177,6 +179,7 @@ export abstract class BaseHarness implements AgentHarness {
               const args = typeof toolCall.function.arguments === "string"
                 ? JSON.parse(toolCall.function.arguments)
                 : toolCall.function.arguments;
+              this.context.assertActive?.();
               output = await tool.execute(args as Record<string, unknown>);
               if (output.length > MAX_TOOL_OUTPUT_LENGTH) {
                 output = output.slice(0, MAX_TOOL_OUTPUT_LENGTH) +
@@ -252,6 +255,7 @@ export abstract class BaseHarness implements AgentHarness {
       output: finalOutput,
       artifacts: [...new Set(this.artifacts)],
       costCents: this.context.budget.costUsedCents,
+      costKnown: this.context.budget.costKnown === true,
       duration: Date.now() - this.context.budget.startedAt,
     };
   }

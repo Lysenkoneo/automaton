@@ -8,6 +8,19 @@
 import type { SocialClientInterface, ParentChildMessage } from "../types.js";
 import { MESSAGE_LIMITS } from "../types.js";
 import { ulid } from "ulid";
+import { validateOutgoingTaskContent } from "../orchestration/messaging.js";
+
+function relayContent(content: string, type: string): string {
+  validateOutgoingTaskContent(content);
+  if (type === "task_assignment" || type === "task_result") {
+    const parsed = JSON.parse(content);
+    const message = parsed.protocol === "colony_message_v1" ? parsed.message : parsed;
+    if (message?.type !== type) throw new Error("Typed task relay requires a complete colony message with attemptId");
+    // Preserve the typed envelope, rather than burying it in an untyped wrapper.
+    return content;
+  }
+  return JSON.stringify({ type, content, sentAt: new Date().toISOString() });
+}
 
 /**
  * Send a message to a child via the social relay.
@@ -22,11 +35,7 @@ export async function sendToChild(
     throw new Error(`Message too long: ${content.length} bytes (max ${MESSAGE_LIMITS.maxContentLength})`);
   }
 
-  const result = await social.send(childAddress, JSON.stringify({
-    type,
-    content,
-    sentAt: new Date().toISOString(),
-  }));
+  const result = await social.send(childAddress, relayContent(content, type));
 
   return { id: result.id };
 }
@@ -44,11 +53,7 @@ export async function sendToParent(
     throw new Error(`Message too long: ${content.length} bytes (max ${MESSAGE_LIMITS.maxContentLength})`);
   }
 
-  const result = await social.send(parentAddress, JSON.stringify({
-    type,
-    content,
-    sentAt: new Date().toISOString(),
-  }));
+  const result = await social.send(parentAddress, relayContent(content, type));
 
   return { id: result.id };
 }

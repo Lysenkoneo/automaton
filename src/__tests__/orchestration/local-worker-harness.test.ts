@@ -1,7 +1,8 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { ulid } from "ulid";
 import { HarnessRegistry } from "../../agent/harness-registry.js";
 import type { AgentHarness, HarnessContext, HarnessTool } from "../../agent/harness-types.js";
 import { LocalWorkerPool } from "../../orchestration/local-worker.js";
@@ -10,6 +11,8 @@ import type { TaskNode, TaskResult } from "../../orchestration/task-graph.js";
 import { getTaskById } from "../../state/database.js";
 import { createInMemoryDb } from "./test-db.js";
 import { createTestConfig, createTestIdentity, MockConwayClient } from "../mocks.js";
+import { assignTask, completeTask, failTask } from "../../orchestration/task-graph.js";
+import { StaleTaskAttemptError } from "../../orchestration/task-attempt.js";
 
 class SuccessHarness implements AgentHarness {
   readonly id = "success";
@@ -141,6 +144,7 @@ describe("orchestration/LocalWorkerPool harness integration", () => {
   });
 
   afterEach(() => {
+    vi.restoreAllMocks();
     db.close();
     fs.rmSync(tempHome, { recursive: true, force: true });
   });
@@ -155,6 +159,7 @@ describe("orchestration/LocalWorkerPool harness integration", () => {
       identity: createTestIdentity(),
       config: createTestConfig(),
       allowedEditRoot: process.cwd(),
+      workspaceBasePath: path.join(tempHome, "workspace"),
     });
   }
 
@@ -198,6 +203,23 @@ describe("orchestration/LocalWorkerPool harness integration", () => {
     expect(row?.result).toMatchObject({ success: false, output: "failed by harness" });
   });
 
+  it.each([false, true])("retains local failure costs and cumulative retry costs, throws=%s", async (throws) => {
+    class CostlyFailure extends FailureHarness {
+      override async execute(): Promise<TaskResult> {
+        if (throws) throw Object.assign(new Error("costly failure"), { costCents: 9 });
+        return { success: false, output: "costly failure", artifacts: [], costCents: 9, duration: 3 };
+      }
+    }
+    registry.register("costly", CostlyFailure);
+    const pool = createPool();
+    const task = insertTask(db, { id: "costly", goalId: "goal-1", agentRole: "costly", status: "assigned", assignedTo: "local://worker-test", maxRetries: 2 });
+    await (pool as any).runWorker("worker-test", task, new AbortController().signal);
+    expect(getTaskById(db, task.id)).toMatchObject({ status: "pending", actualCostCents: 9, result: { success: false, costCents: 9, attemptId: task.attemptId } });
+    const token = assignTask(db, task.id, "local://worker-test");
+    completeTask(db, task.id, { success: true, output: "retry", artifacts: [], costCents: 4, duration: 1 }, { taskId: task.id, workerAddress: "local://worker-test", attemptId: token });
+    expect(getTaskById(db, task.id)).toMatchObject({ actualCostCents: 13, result: { costCents: 4 } });
+  });
+
   it("tracks active workers for spawn/hasWorker/getActiveCount", async () => {
     registry.register("custom-slow", SlowHarness);
     const pool = createPool();
@@ -211,14 +233,170 @@ describe("orchestration/LocalWorkerPool harness integration", () => {
     });
 
     const spawned = pool.spawn(task);
+    db.prepare("UPDATE task_graph SET assigned_to = ?, attempt_id = ? WHERE id = ?").run(spawned.address, spawned.attemptId, task.id);
     expect(pool.getActiveCount()).toBe(1);
     expect(pool.hasWorker(spawned.address)).toBe(true);
     expect(pool.hasWorker(spawned.sandboxId)).toBe(true);
+
+    const resumedPool = createPool();
+    expect(resumedPool.hasWorker(spawned.address)).toBe(true);
+    expect(resumedPool.getActiveCount()).toBe(1);
+    const otherDb = createInMemoryDb();
+    try {
+      const unrelatedPool = new LocalWorkerPool({ ...(pool as any).config, db: otherDb });
+      expect(unrelatedPool.hasWorker(spawned.address)).toBe(false);
+    } finally {
+      otherDb.close();
+    }
 
     await waitFor(async () => SlowHarness.release !== null);
     SlowHarness.release?.();
     await waitFor(async () => pool.getActiveCount() === 0);
     expect(pool.getActiveCount()).toBe(0);
+    expect(resumedPool.getActiveCount()).toBe(0);
+    expect(getTaskById(db, task.id)?.status).toBe("completed");
+  });
+
+  it("publishes an immediately resolving spawned harness only after assignment", async () => {
+    registry.register("custom-success", SuccessHarness);
+    const pool = createPool();
+    const task = insertTask(db, {
+      id: "task-fast", goalId: "goal-1", agentRole: "custom-success",
+      status: "pending", assignedTo: null, maxRetries: 0,
+    });
+    const spawned = await Promise.resolve(pool.spawn(task));
+    db.prepare("UPDATE task_graph SET status = 'assigned', assigned_to = ?, attempt_id = ? WHERE id = ?")
+      .run(spawned.address, spawned.attemptId, task.id);
+    await waitFor(() => pool.getActiveCount() === 0);
+    expect(getTaskById(db, task.id)?.status).toBe("completed");
+  });
+
+  it.each(["success", "failure", "throw"])("ignores a late %s from a reassigned worker", async (outcome) => {
+    registry.register("custom-slow", SlowHarness);
+    const pool = createPool();
+    const task = insertTask(db, {
+      id: "task-late", goalId: "goal-1", agentRole: "custom-slow",
+      status: "assigned", assignedTo: "local://worker-old", maxRetries: 2,
+    });
+    const execute = vi.spyOn(SlowHarness.prototype, "execute").mockImplementation(async () => {
+      await new Promise<void>((resolve) => { SlowHarness.release = resolve; });
+      if (outcome === "throw") throw new Error("late error");
+      return { success: outcome === "success", output: "late result", artifacts: [], costCents: 9, duration: 1 };
+    });
+    const running = (pool as any).runWorker("worker-old", task, new AbortController().signal);
+    await waitFor(() => SlowHarness.release !== null);
+    db.prepare("UPDATE task_graph SET assigned_to = ? WHERE id = ?").run("local://worker-new", task.id);
+    const before = getTaskById(db, task.id);
+    SlowHarness.release?.();
+    await running;
+    expect(getTaskById(db, task.id)).toEqual(before);
+    execute.mockRestore();
+  });
+
+  it("ignores a late crash before harness initialization after reassignment", async () => {
+    const pool = createPool();
+    const task = insertTask(db, {
+      id: "task-crash", goalId: "goal-1", agentRole: "generalist",
+      status: "pending", assignedTo: null, maxRetries: 2,
+    });
+    vi.spyOn(registry, "createForRole").mockImplementation(() => { throw new Error("crash"); });
+    pool.spawn(task);
+    db.prepare("UPDATE task_graph SET status = 'assigned', assigned_to = ? WHERE id = ?")
+      .run("local://worker-new", task.id);
+    const before = getTaskById(db, task.id);
+    await waitFor(() => pool.getActiveCount() === 0);
+    expect(getTaskById(db, task.id)).toEqual(before);
+  });
+
+  it.each(["success", "failure", "throw"])("ignores a late %s when the same worker address receives a new attempt", async (outcome) => {
+    registry.register("custom-slow", SlowHarness);
+    const pool = createPool();
+    const task = insertTask(db, {
+      id: "task-same-address", goalId: "goal-1", agentRole: "custom-slow",
+      status: "assigned", assignedTo: "local://worker-test", maxRetries: 2,
+    });
+    vi.spyOn(SlowHarness.prototype, "execute").mockImplementation(async () => {
+      await new Promise<void>((resolve) => { SlowHarness.release = resolve; });
+      if (outcome === "throw") throw new Error("late error");
+      return { success: outcome === "success", output: "old attempt", artifacts: [], costCents: 9, duration: 1 };
+    });
+    const running = (pool as any).runWorker("worker-test", task, new AbortController().signal);
+    await waitFor(() => SlowHarness.release !== null);
+    failTask(db, task.id, "retry", true);
+    const newAttempt = assignTask(db, task.id, "local://worker-test");
+    expect(newAttempt).not.toBe(task.attemptId);
+    const before = getTaskById(db, task.id);
+    SlowHarness.release?.();
+    await running;
+    expect(getTaskById(db, task.id)).toEqual(before);
+  });
+
+  it.each(["complete", "fail", "sql"])("revokes the worker context before a late direct %s write", async (operation) => {
+    registry.register("custom-slow", SlowHarness);
+    const pool = createPool();
+    const task = insertTask(db, {
+      id: "task-direct-late", goalId: "goal-1", agentRole: "custom-slow",
+      status: "assigned", assignedTo: "local://worker-test", maxRetries: 2,
+    });
+    let context!: HarnessContext;
+    vi.spyOn(SlowHarness.prototype, "initialize").mockImplementation(async (_task, ctx) => { context = ctx; });
+    let rejected = false;
+    vi.spyOn(SlowHarness.prototype, "execute").mockImplementation(async () => {
+      await new Promise<void>((resolve) => { SlowHarness.release = resolve; });
+      try {
+        // complete/fail deliberately use the raw connection captured by a
+        // harness; their inherited async scope must still reject the write.
+        if (operation === "complete") completeTask(db, task.id, { success: true, output: "late", artifacts: [], costCents: 0, duration: 1 });
+        if (operation === "fail") failTask(db, task.id, "late", true);
+        if (operation === "sql") context.db.prepare("UPDATE task_graph SET title='late' WHERE id=?").run(task.id);
+      } catch (error) { rejected = error instanceof StaleTaskAttemptError; }
+      return { success: true, output: "old attempt", artifacts: [], costCents: 0, duration: 1 };
+    });
+    const running = (pool as any).runWorker("worker-test", task, new AbortController().signal);
+    await waitFor(() => SlowHarness.release !== null);
+    failTask(db, task.id, "retry", true);
+    assignTask(db, task.id, "local://worker-test");
+    const before = getTaskById(db, task.id);
+    SlowHarness.release?.();
+    await running;
+    expect(rejected).toBe(true);
+    expect(getTaskById(db, task.id)).toEqual(before);
+  });
+
+  it("keeps workers spawned during shutdown registered in every pool for the connection", async () => {
+    registry.register("custom-slow", SlowHarness);
+    const pool = createPool();
+    const resumedPool = createPool();
+    const releases: Array<() => void> = [];
+    const contexts: HarnessContext[] = [];
+    vi.spyOn(SlowHarness.prototype, "initialize").mockImplementation(async (_task, context) => { contexts.push(context); });
+    vi.spyOn(SlowHarness.prototype, "execute").mockImplementation(async () => {
+      await new Promise<void>((resolve) => { releases.push(resolve); });
+      return { success: true, output: "done", artifacts: [], costCents: 0, duration: 1 };
+    });
+    const start = (id: string, target: LocalWorkerPool) => {
+      const task = insertTask(db, { id, goalId: "goal-1", agentRole: "custom-slow", status: "pending", assignedTo: null, maxRetries: 0 });
+      const worker = target.spawn(task);
+      assignTask(db, task.id, worker.address, worker.attemptId);
+      return worker;
+    };
+    const first = start("task-stop", pool);
+    await waitFor(() => releases.length === 1);
+    const stopping = pool.shutdown();
+    const second = start("task-next-cycle", resumedPool);
+    await waitFor(() => releases.length === 2);
+    expect(first.address).not.toBe(second.address);
+    expect(contexts[0].abortSignal.aborted).toBe(true);
+    expect(contexts[1].abortSignal.aborted).toBe(false);
+    releases[0]();
+    await stopping;
+    expect(pool.getActiveCount()).toBe(1);
+    expect(pool.hasWorker(second.address, second.attemptId)).toBe(true);
+    expect(resumedPool.hasWorker(second.address, second.attemptId)).toBe(true);
+    expect(pool.hasWorker(second.address, first.attemptId)).toBe(false);
+    releases[1]();
+    await waitFor(() => pool.getActiveCount() === 0);
+    expect(getTaskById(db, "task-next-cycle")?.status).toBe("completed");
   });
 
   it("gives orchestrator-role harnesses a 50-turn default budget", async () => {
@@ -320,7 +498,7 @@ describe("orchestration/LocalWorkerPool harness integration", () => {
     ).all("goal-1", "task-orchestrator-run") as Array<{ parentId: string; title: string; agentRole: string | null }>;
     expect(delegated.some((entry) => entry.title === "Implement planned subtask" && entry.agentRole === "executor")).toBe(true);
 
-    const planDir = path.join(tempHome, ".automaton", "workspace", "goal-1", "subplans", "task-orchestrator-run");
+    const planDir = path.join(tempHome, ".automaton", "workspace", "goal-1", "attempts", task.attemptId!, "subplans", "task-orchestrator-run");
     expect(fs.existsSync(path.join(planDir, "plan.json"))).toBe(true);
     expect(fs.existsSync(path.join(planDir, "plan.md"))).toBe(true);
   });
@@ -361,6 +539,10 @@ function insertTask(
     new Date().toISOString(),
   );
 
+  if (overrides.status === "assigned" || overrides.status === "running") {
+    db.prepare("UPDATE task_graph SET attempt_id = ? WHERE id = ?").run(ulid(), overrides.id);
+  }
+
   const row = getTaskById(db, overrides.id);
   if (!row) {
     throw new Error(`Failed to load task ${overrides.id}`);
@@ -374,6 +556,7 @@ function insertTask(
     description: row.description,
     status: row.status,
     assignedTo: row.assignedTo,
+    attemptId: row.attemptId,
     agentRole: row.agentRole,
     priority: row.priority,
     dependencies: row.dependencies,

@@ -1,5 +1,6 @@
 import type { Database } from "better-sqlite3";
 import { ulid } from "ulid";
+import { StaleTaskAttemptError, type TaskAttempt } from "./task-attempt.js";
 import type { AutomatonIdentity } from "../types.js";
 import { createLogger } from "../observability/logger.js";
 import {
@@ -22,7 +23,8 @@ import {
   type PlannedTask,
   taskToPlannerFailureInput,
 } from "./planner.js";
-import { ColonyMessaging, type AgentMessage } from "./messaging.js";
+import { ColonyMessaging, taskMessageAttemptId, type AgentMessage } from "./messaging.js";
+import { createPublishedGoalWorkspace } from "./workspace-publication.js";
 import { generateTodoMd } from "./attention.js";
 import { UnifiedInferenceClient } from "../inference/inference-client.js";
 import { reviewPlan } from "./plan-mode.js";
@@ -70,7 +72,10 @@ interface OrchestratorState {
 }
 
 interface TaskResultEnvelope {
+  queueKey?: string;
   taskId: string;
+  workerAddress: string;
+  attemptId: string | null;
   goalId: string | null;
   result: TaskResult;
   error?: string;
@@ -102,7 +107,7 @@ export class Orchestrator {
     identity: AutomatonIdentity;
     config: any;
     /** Check if a worker agent is still alive. Used to recover stale tasks. */
-    isWorkerAlive?: (address: string) => boolean;
+    isWorkerAlive?: (address: string, attemptId?: string) => boolean;
   }) {}
 
   async tick(): Promise<OrchestratorTickResult> {
@@ -265,24 +270,41 @@ export class Orchestrator {
     this.pendingTaskResults = [];
 
     const processed = await this.params.messaging.processInbox();
-    for (const entry of processed) {
+    const durable = typeof this.params.messaging.getPendingTaskResults === "function"
+      ? this.params.messaging.getPendingTaskResults() : [];
+    const discard = (queueKey: string) => {
+      try { this.params.messaging.consumeTaskResult(queueKey, this.params.db, () => undefined); }
+      catch (error) { this.params.messaging.retryTaskResult(queueKey, error); }
+    };
+    const seen = new Set<string>();
+    for (const entry of [...durable, ...processed]) {
+      if (entry.queueKey && seen.has(entry.queueKey)) continue;
+      if (entry.queueKey) seen.add(entry.queueKey);
       if (!entry.success || entry.message.type !== "task_result") {
+        if (entry.queueKey) discard(entry.queueKey);
         continue;
       }
 
       const parsed = parseTaskResultMessage(entry.message);
       if (!parsed) {
+        logger.warn("Rejected ambiguous task result", { messageId: entry.message.id, taskId: entry.message.taskId });
+        if (entry.queueKey) discard(entry.queueKey);
         continue;
       }
+      if (!parsed.attemptId) logger.warn("Rejected legacy task result without attemptId", { messageId: entry.message.id, taskId: parsed.taskId });
 
-      this.pendingTaskResults.push(parsed);
+      this.pendingTaskResults.push({ ...parsed, ...(entry.queueKey ? { queueKey: entry.queueKey } : {}) });
     }
 
     return this.pendingTaskResults.map((entry) => entry.result);
   }
 
-  async handleFailure(task: TaskNode, error: string): Promise<void> {
-    failTask(this.params.db, task.id, error, true);
+  async handleFailure(task: TaskNode, error: string, attempt?: TaskAttempt, result?: TaskResult): Promise<void> {
+    this.recordTaskFailure(task, error, attempt, result);
+  }
+
+  private recordTaskFailure(task: TaskNode, error: string, attempt?: TaskAttempt, result?: TaskResult): void {
+    failTask(this.params.db, task.id, error, true, attempt, result);
 
     const latest = getTaskById(this.params.db, task.id);
     if (!latest || latest.status !== "failed") {
@@ -402,7 +424,7 @@ export class Orchestrator {
         goalToPlannerInput(goalRowToGoal(goal)),
         await buildPlannerContext({
           db: this.params.db,
-          workspace: new AgentWorkspace(goal.id),
+          workspace: createPublishedGoalWorkspace(this.params.db, goal.id),
           funding: this.params.funding,
           identityAddress: this.params.identity.address,
           usdcBalance: Number(this.params.config?.usdcBalance ?? 0),
@@ -528,32 +550,85 @@ export class Orchestrator {
       };
     }
 
+    const retryNextTick = new Set<string>();
+    // Apply queued results before deciding that an assignment is abandoned.
+    await this.collectResults();
+
+    for (const event of this.pendingTaskResults) {
+      const apply = (): "completed" | "failure" | "ignored" => {
+        const task = getTaskById(this.params.db, event.taskId);
+        if (!task || task.assignedTo !== event.workerAddress || !event.attemptId ||
+            task.attemptId !== event.attemptId || !["assigned", "running"].includes(task.status)) return "ignored";
+        const attempt: TaskAttempt = { taskId: task.id, workerAddress: event.workerAddress, attemptId: event.attemptId };
+        if (event.result.success) {
+          completeTask(this.params.db, task.id, event.result, attempt);
+          return "completed";
+        }
+        this.recordTaskFailure(taskRowToTaskNode(task), event.error ?? event.result.output, attempt, event.result);
+        return "failure";
+      };
+      // Storage errors roll back completion and dequeue; they are not worker failures.
+      let outcome: ReturnType<typeof apply> | null;
+      try {
+        outcome = event.queueKey
+          ? this.params.messaging.consumeTaskResult(event.queueKey, this.params.db, apply)
+          : this.params.db.transaction(apply).immediate();
+      } catch (error) {
+        if (!event.queueKey) throw error;
+        logger.error("Result application rolled back; durable result retained for retry", normalizeError(error), { taskId: event.taskId });
+        this.params.messaging.retryTaskResult(event.queueKey, error);
+        continue;
+      }
+      if (outcome === "completed") {
+        counters.tasksCompleted += 1;
+        this.params.agentTracker.updateStatus(event.workerAddress, "healthy");
+      } else if (outcome === "failure") {
+        retryNextTick.add(event.taskId);
+        if (getTaskById(this.params.db, event.taskId)?.status === "failed") counters.tasksFailed += 1;
+      }
+    }
+
     // Recover stale tasks: workers that died (process restart, sandbox crash)
     // leave tasks stuck in 'assigned' forever. Detect and reset them.
     if (this.params.isWorkerAlive) {
       const assignedTasks = getTasksByGoal(this.params.db, goal.id)
-        .filter((t) => t.status === "assigned" && t.assignedTo);
+        .filter((t) => (t.status === "assigned" || t.status === "running") && t.assignedTo);
       for (const task of assignedTasks) {
-        const alive = this.params.isWorkerAlive(task.assignedTo!);
+        // NULL identifies an assignment issued before attempt fencing existed.
+        // Liveness alone cannot prove that its process/external writes stopped.
+        // Quarantine it until an operator neutralizes the old execution.
+        if (!task.attemptId) {
+          logger.warn("Legacy assignment quarantined; worker neutralization required", { taskId: task.id, worker: task.assignedTo });
+          continue;
+        }
+        if (typeof this.params.messaging.hasPendingTaskResult === "function" &&
+            this.params.messaging.hasPendingTaskResult(task.id, task.attemptId)) continue;
+        // The parent executes these tasks outside worker tracking.
+        if (task.assignedTo === this.params.identity.address) continue;
+        const alive = this.params.isWorkerAlive(task.assignedTo!, task.attemptId);
         if (!alive) {
           logger.warn("Recovering stale task from dead worker", {
             taskId: task.id,
+            attemptId: task.attemptId,
             worker: task.assignedTo,
           });
           this.params.db.prepare(
-            "UPDATE task_graph SET status = 'pending', assigned_to = NULL, started_at = NULL WHERE id = ?",
-          ).run(task.id);
+            "UPDATE task_graph SET status = 'pending', assigned_to = NULL, attempt_id = NULL, started_at = NULL WHERE id = ? AND assigned_to = ? AND attempt_id IS ? AND status IN ('assigned', 'running')",
+          ).run(task.id, task.assignedTo, task.attemptId);
         }
       }
     }
 
     const ready = getReadyTasks(this.params.db)
-      .filter((task) => task.goalId === goal.id);
+      .filter((task) => task.goalId === goal.id && !retryNextTick.has(task.id));
 
     for (const task of ready) {
+      const attemptId = ulid();
+      let assignedAttempt: TaskAttempt | undefined;
       try {
-        const assignment = await this.matchTaskToAgent(task);
-        assignTask(this.params.db, task.id, assignment.agentAddress);
+        const assignment = await this.matchTaskToAgent({ ...task, attemptId });
+        assignTask(this.params.db, task.id, assignment.agentAddress, attemptId);
+        assignedAttempt = { taskId: task.id, workerAddress: assignment.agentAddress, attemptId };
 
         const isLocalWorker = assignment.agentAddress.startsWith("local://");
         const isSelfAssigned = assignment.agentAddress === this.params.identity?.address;
@@ -569,10 +644,12 @@ export class Orchestrator {
             to: assignment.agentAddress,
             goalId: task.goalId,
             taskId: task.id,
+            attemptId,
             priority: "high",
             requiresResponse: true,
             content: JSON.stringify({
               taskId: task.id,
+              attemptId,
               title: task.title,
               description: task.description,
               agentRole: task.agentRole,
@@ -600,48 +677,17 @@ export class Orchestrator {
         }
 
         const previous = getTaskById(this.params.db, task.id);
-        await this.handleFailure(task, err.message);
+        if (!assignedAttempt && previous?.status !== "pending") continue;
+        try {
+          await this.handleFailure(task, err.message, assignedAttempt);
+        } catch (failure) {
+          if (failure instanceof StaleTaskAttemptError) continue;
+          throw failure;
+        }
         const latest = getTaskById(this.params.db, task.id);
         if (previous?.status !== "failed" && latest?.status === "failed") {
           counters.tasksFailed += 1;
         }
-      }
-    }
-
-    await this.collectResults();
-
-    for (const event of this.pendingTaskResults) {
-      const taskRow = getTaskById(this.params.db, event.taskId);
-      if (!taskRow) {
-        continue;
-      }
-
-      if (event.result.success) {
-        try {
-          completeTask(this.params.db, taskRow.id, event.result);
-          counters.tasksCompleted += 1;
-
-          if (taskRow.assignedTo) {
-            this.params.agentTracker.updateStatus(taskRow.assignedTo, "healthy");
-          }
-        } catch (error) {
-          const err = normalizeError(error);
-          const taskNode = taskRowToTaskNode(taskRow);
-          await this.handleFailure(taskNode, err.message);
-          const latest = getTaskById(this.params.db, taskNode.id);
-          if (taskRow.status !== "failed" && latest?.status === "failed") {
-            counters.tasksFailed += 1;
-          }
-        }
-
-        continue;
-      }
-
-      const taskNode = taskRowToTaskNode(taskRow);
-      await this.handleFailure(taskNode, event.error ?? event.result.output);
-      const latest = getTaskById(this.params.db, taskNode.id);
-      if (taskRow.status !== "failed" && latest?.status === "failed") {
-        counters.tasksFailed += 1;
       }
     }
 
@@ -685,6 +731,14 @@ export class Orchestrator {
       };
     }
 
+    // A new goal-wide plan can overlap an unfenced legacy execution. Do not
+    // start it until those old processes and external effects are neutralized.
+    if (getTasksByGoal(this.params.db, goal.id).some((task) =>
+      ["assigned", "running"].includes(task.status) && !task.attemptId)) {
+      logger.warn("Replanning blocked by legacy assignment", { goalId: goal.id });
+      return state;
+    }
+
     const failedTaskRow = state.failedTaskId
       ? getTaskById(this.params.db, state.failedTaskId)
       : getTasksByGoal(this.params.db, goal.id).find((task) => task.status === "failed");
@@ -703,7 +757,7 @@ export class Orchestrator {
         taskToPlannerFailureInput(taskRowToTaskNode(failedTaskRow)),
         await buildPlannerContext({
           db: this.params.db,
-          workspace: new AgentWorkspace(goal.id),
+          workspace: createPublishedGoalWorkspace(this.params.db, goal.id),
           funding: this.params.funding,
           identityAddress: this.params.identity.address,
           usdcBalance: Number(this.params.config?.usdcBalance ?? 0),
@@ -1052,6 +1106,7 @@ function taskRowToTaskNode(task: TaskGraphRow): TaskNode {
     description: task.description,
     status: task.status,
     assignedTo: task.assignedTo,
+    attemptId: task.attemptId,
     agentRole: task.agentRole,
     priority: task.priority,
     dependencies: task.dependencies,
@@ -1080,6 +1135,8 @@ function parseTaskResultMessage(message: AgentMessage): TaskResultEnvelope | nul
 
     return {
       taskId: fallbackTaskId,
+      workerAddress: message.from,
+      attemptId: null,
       goalId: message.goalId,
       result: {
         success: true,
@@ -1095,6 +1152,8 @@ function parseTaskResultMessage(message: AgentMessage): TaskResultEnvelope | nul
   const nested = obj.result && typeof obj.result === "object"
     ? obj.result as Record<string, unknown>
     : obj;
+  let attemptId: string | null;
+  try { attemptId = taskMessageAttemptId(message); } catch { return null; }
 
   const taskId = firstString(obj.taskId, fallbackTaskId);
   if (!taskId) {
@@ -1105,6 +1164,8 @@ function parseTaskResultMessage(message: AgentMessage): TaskResultEnvelope | nul
   const output = firstString(nested.output, obj.output, success ? "ok" : "task failed") ?? "";
 
   const result: TaskResult = {
+    ...(typeof nested.costKnown === "boolean" ? { costKnown: nested.costKnown } : {}),
+    ...(attemptId ? { attemptId } : {}),
     success,
     output,
     artifacts: normalizeArtifacts(nested.artifacts ?? obj.artifacts),
@@ -1114,6 +1175,8 @@ function parseTaskResultMessage(message: AgentMessage): TaskResultEnvelope | nul
 
   return {
     taskId,
+    workerAddress: message.from,
+    attemptId,
     goalId: message.goalId,
     result,
     error: success ? undefined : (firstString(obj.error, output) ?? undefined),

@@ -7,6 +7,7 @@ import type { MessageTransport } from "../../orchestration/messaging.js";
 import { ColonyMessaging } from "../../orchestration/messaging.js";
 import type { AutomatonDatabase } from "../../types.js";
 import { createInMemoryDb } from "./test-db.js";
+import { assignTask, failTask } from "../../orchestration/task-graph.js";
 
 // ─── Fixtures ───────────────────────────────────────────────────
 
@@ -78,6 +79,7 @@ function makeOrchestrator(
     inference?: ReturnType<typeof makeInference>;
     config?: any;
     messaging?: ColonyMessaging;
+    isWorkerAlive?: (address: string) => boolean;
   } = {},
 ): Orchestrator {
   const { messaging } = makeMessaging(db);
@@ -89,6 +91,7 @@ function makeOrchestrator(
     inference: overrides.inference ?? (makeInference() as any),
     identity: IDENTITY,
     config: overrides.config ?? {},
+    isWorkerAlive: overrides.isWorkerAlive,
   });
 }
 
@@ -145,6 +148,9 @@ function insertTask(db: BetterSqlite3.Database, overrides: {
     JSON.stringify(overrides.dependencies ?? []),
     new Date().toISOString(),
   );
+  if (overrides.status === "assigned" || overrides.status === "running") {
+    db.prepare("UPDATE task_graph SET attempt_id = ? WHERE id = ?").run(ulid(), id);
+  }
   return id;
 }
 
@@ -481,9 +487,147 @@ describe("orchestration/Orchestrator", () => {
     });
   });
 
+  describe("stale task recovery", () => {
+    it("recovers a dead running attempt with a fresh ID and preserves a live running attempt", async () => {
+      const goalId = insertGoal(db);
+      const dead = insertTask(db, { goalId, status: "running", assignedTo: "local://dead" });
+      const live = insertTask(db, { goalId, status: "running", assignedTo: "local://live" });
+      const old = db.prepare("SELECT attempt_id FROM task_graph WHERE id=?").get(dead) as { attempt_id: string };
+      setOrchestratorState(db, { phase: "executing", goalId, replanCount: 0 });
+      await makeOrchestrator(db, { isWorkerAlive: (address) => address === "local://live" }).tick();
+      const recovered = db.prepare("SELECT status, assigned_to, attempt_id FROM task_graph WHERE id=?").get(dead) as { attempt_id: string };
+      expect(recovered).toMatchObject({ status: "assigned", assigned_to: IDENTITY.address });
+      expect(recovered.attempt_id).not.toBe(old.attempt_id);
+      expect(db.prepare("SELECT status, assigned_to FROM task_graph WHERE id=?").get(live))
+        .toEqual({ status: "running", assigned_to: "local://live" });
+    });
+
+    it.each([true, false])("quarantines a legacy worker assignment regardless of liveness=%s", async (alive) => {
+      const goalId = insertGoal(db);
+      const taskId = insertTask(db, { goalId, status: "assigned", assignedTo: "0xlegacy" });
+      db.prepare("UPDATE task_graph SET attempt_id=NULL WHERE id=?").run(taskId);
+      setOrchestratorState(db, { phase: "executing", goalId, replanCount: 0 });
+      const result = await makeOrchestrator(db, { isWorkerAlive: () => alive }).tick();
+      expect(result.tasksAssigned).toBe(0);
+      expect(db.prepare("SELECT assigned_to, attempt_id FROM task_graph WHERE id=?").get(taskId))
+        .toMatchObject({ assigned_to: "0xlegacy", attempt_id: null });
+    });
+    it("preserves parent and live worker assignments while recovering dead workers", async () => {
+      const goalId = insertGoal(db);
+      const parent = insertTask(db, { goalId, status: "assigned", assignedTo: IDENTITY.address });
+      const live = insertTask(db, { goalId, status: "assigned", assignedTo: "local://live" });
+      const dead = insertTask(db, { goalId, status: "assigned", assignedTo: "local://dead" });
+      const isWorkerAlive = vi.fn((address: string) => address === "local://live");
+      setOrchestratorState(db, { phase: "executing", goalId, replanCount: 0 });
+      const orc = makeOrchestrator(db, { isWorkerAlive });
+      const result = await orc.tick();
+      const assignment = (id: string) => db.prepare("SELECT status, assigned_to FROM task_graph WHERE id = ?").get(id);
+      expect(assignment(parent)).toEqual({ status: "assigned", assigned_to: IDENTITY.address });
+      expect(assignment(live)).toEqual({ status: "assigned", assigned_to: "local://live" });
+      expect(assignment(dead)).toEqual({ status: "assigned", assigned_to: IDENTITY.address });
+      expect(result.tasksAssigned).toBe(1);
+      expect(isWorkerAlive).not.toHaveBeenCalledWith(IDENTITY.address);
+    });
+  });
+
   // ─── collectResults ──────────────────────────────────────────
 
   describe("collectResults", () => {
+    it("sends the persisted attempt ID in remote task assignments", async () => {
+      const goalId = insertGoal(db);
+      const taskId = insertTask(db, { goalId });
+      setOrchestratorState(db, { phase: "executing", goalId, replanCount: 0 });
+      const { messaging, transport } = makeMessaging(db);
+      const tracker = makeAgentTracker({ getIdle: () => [{ address: "0xagent", name: "Agent", role: "generalist", status: "healthy" }] });
+      const result = await makeOrchestrator(db, { messaging, agentTracker: tracker }).tick();
+      expect(result.tasksAssigned).toBe(1);
+      const envelope = JSON.parse((transport.deliver as ReturnType<typeof vi.fn>).mock.calls[0][1]);
+      const content = JSON.parse(envelope.message.content);
+      const persisted = db.prepare("SELECT assigned_to, attempt_id FROM task_graph WHERE id=?").get(taskId);
+      expect(persisted).toEqual({ assigned_to: "0xagent", attempt_id: content.attemptId });
+      expect(content.attemptId).toEqual(expect.any(String));
+      expect(content.taskId).toBe(taskId);
+    });
+
+    it("rejects conflicting outer and nested result attempt IDs", async () => {
+      const goalId = insertGoal(db);
+      const taskId = insertTask(db, { goalId });
+      const attemptId = assignTask(db, taskId, "0xagent");
+      setOrchestratorState(db, { phase: "executing", goalId, replanCount: 0 });
+      const messaging = buildMessagingWithResults(db, [{ type: "task_result", content: JSON.stringify({
+        taskId, attemptId, result: { attemptId: "old", success: true, output: "old" },
+      }) }]);
+      expect((await makeOrchestrator(db, { messaging }).tick()).tasksCompleted).toBe(0);
+      expect(db.prepare("SELECT status FROM task_graph WHERE id=?").get(taskId)).toEqual({ status: "assigned" });
+    });
+
+    it("accepts a current failure with a nested token and rotates the ID on retry", async () => {
+      const goalId = insertGoal(db);
+      const taskId = insertTask(db, { goalId });
+      const attemptId = assignTask(db, taskId, "0xagent");
+      setOrchestratorState(db, { phase: "executing", goalId, replanCount: 0 });
+      const messaging = buildMessagingWithResults(db, [{ type: "task_result", content: JSON.stringify({
+        taskId, result: { attemptId, success: false, output: "retry" },
+      }) }]);
+      await makeOrchestrator(db, { messaging }).tick();
+      expect(db.prepare("SELECT status, attempt_id, assigned_to, retry_count FROM task_graph WHERE id=?").get(taskId))
+        .toEqual({ status: "pending", attempt_id: null, assigned_to: null, retry_count: 1 });
+      expect(assignTask(db, taskId, "0xagent")).not.toBe(attemptId);
+    });
+    it.each([true, false])("rejects an old remote attempt at the same address, success=%s", async (success) => {
+      const goalId = insertGoal(db);
+      const taskId = insertTask(db, { goalId });
+      const oldAttempt = assignTask(db, taskId, "0xagent");
+      failTask(db, taskId, "retry", true);
+      const currentAttempt = assignTask(db, taskId, "0xagent");
+      expect(currentAttempt).not.toBe(oldAttempt);
+      setOrchestratorState(db, { phase: "executing", goalId, replanCount: 0 });
+      const before = db.prepare("SELECT * FROM task_graph WHERE id=?").get(taskId);
+      const messaging = buildMessagingWithResults(db, [{ type: "task_result", content: JSON.stringify({
+        taskId, attemptId: oldAttempt, success, output: "old attempt",
+      }) }]);
+      const result = await makeOrchestrator(db, { messaging }).tick();
+      expect(result.tasksCompleted).toBe(0);
+      expect(result.tasksFailed).toBe(0);
+      expect(db.prepare("SELECT * FROM task_graph WHERE id=?").get(taskId)).toEqual(before);
+    });
+
+    it("rejects a missing result token even from the currently assigned address", async () => {
+      const goalId = insertGoal(db);
+      const taskId = insertTask(db, { goalId, status: "assigned", assignedTo: "0xagent" });
+      setOrchestratorState(db, { phase: "executing", goalId, replanCount: 0 });
+      const messaging = buildMessagingWithResults(db, [{ type: "task_result", content: JSON.stringify({ taskId, success: true }) }]);
+      expect((await makeOrchestrator(db, { messaging }).tick()).tasksCompleted).toBe(0);
+      expect(db.prepare("SELECT status FROM task_graph WHERE id=?").get(taskId)).toEqual({ status: "assigned" });
+    });
+    it.each([true, false])("ignores a late remote result with success=%s after reassignment", async (success) => {
+      const goalId = insertGoal(db);
+      const taskId = insertTask(db, { goalId, status: "assigned", assignedTo: "0xnew" });
+      setOrchestratorState(db, { phase: "executing", goalId, replanCount: 0 });
+      const before = db.prepare("SELECT * FROM task_graph WHERE id = ?").get(taskId);
+      const messaging = buildMessagingWithResults(db, [{
+        type: "task_result", content: JSON.stringify({ taskId, success, output: "old result" }),
+      }]);
+      const tracker = makeAgentTracker();
+      const result = await makeOrchestrator(db, { messaging, agentTracker: tracker }).tick();
+      expect(db.prepare("SELECT * FROM task_graph WHERE id = ?").get(taskId)).toEqual(before);
+      expect(result.tasksCompleted).toBe(0);
+      expect(result.tasksFailed).toBe(0);
+      expect(tracker.updateStatus).not.toHaveBeenCalled();
+    });
+
+    it("applies a result from the current remote worker", async () => {
+      const goalId = insertGoal(db);
+      const taskId = insertTask(db, { goalId, status: "assigned", assignedTo: "0xagent" });
+      const { attempt_id: attemptId } = db.prepare("SELECT attempt_id FROM task_graph WHERE id = ?").get(taskId) as { attempt_id: string };
+      setOrchestratorState(db, { phase: "executing", goalId, replanCount: 0 });
+      const messaging = buildMessagingWithResults(db, [{
+        type: "task_result", content: JSON.stringify({ taskId, attemptId, success: true, output: "current result" }),
+      }]);
+      const result = await makeOrchestrator(db, { messaging }).tick();
+      expect(result.tasksCompleted).toBe(1);
+      expect(db.prepare("SELECT status FROM task_graph WHERE id = ?").get(taskId)).toEqual({ status: "completed" });
+    });
     function buildMessagingWithResults(
       raw: BetterSqlite3.Database,
       messages: Array<{ type: string; content: string }>,

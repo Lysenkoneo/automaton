@@ -7,6 +7,11 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { runAgentLoop } from "../agent/loop.js";
 import { Orchestrator } from "../orchestration/orchestrator.js";
+import { LocalWorkerPool } from "../orchestration/local-worker.js";
+import { HarnessRegistry } from "../agent/harness-registry.js";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import {
   MockInferenceClient,
   MockConwayClient,
@@ -18,6 +23,13 @@ import {
   noToolResponse,
 } from "./mocks.js";
 import type { AutomatonDatabase, AgentTurn, AgentState } from "../types.js";
+import type { TaskNode } from "../orchestration/task-graph.js";
+
+// Keep loop tests independent of live blockchain RPC calls.
+vi.mock("../conway/x402.js", async (importOriginal) => ({
+  ...await importOriginal<typeof import("../conway/x402.js")>(),
+  getUsdcBalance: async () => 0,
+}));
 
 describe("Agent Loop", () => {
   let db: AutomatonDatabase;
@@ -871,5 +883,56 @@ describe("Agent Loop", () => {
 
     expect(inference.calls.length).toBeGreaterThan(0);
     tickSpy.mockRestore();
+  });
+
+  it("keeps a local worker alive across two sleeping loop cycles", async () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "loop-worker-"));
+    let release!: () => void;
+    const waiting = new Promise<void>((resolve) => { release = resolve; });
+    const registry = new HarnessRegistry();
+    vi.spyOn(registry, "createForRole").mockReturnValue({
+      id: "waiting", description: "waiting harness",
+      initialize: async () => {},
+      execute: async () => {
+        await waiting;
+        return { success: true, output: "done", artifacts: [], costCents: 0, duration: 1 };
+      },
+      getToolDefs: () => [], buildSystemPrompt: () => "", buildTaskPrompt: () => "",
+    });
+    db.raw.prepare("INSERT INTO goals (id, title, description, status, created_at) VALUES (?, ?, ?, ?, ?)")
+      .run("goal-live", "Live goal", "Live goal", "active", new Date().toISOString());
+    db.raw.prepare("INSERT INTO task_graph (id, goal_id, title, description, status, dependencies, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
+      .run("task-live", "goal-live", "Live task", "Live task", "pending", "[]", new Date().toISOString());
+    const pool = new LocalWorkerPool({
+      db: db.raw, conway, identity, config, harnessRegistry: registry,
+      inference: { chat: async () => ({ content: "" }) }, workspaceBasePath: tempDir,
+    });
+    const task: TaskNode = {
+      id: "task-live", parentId: null, goalId: "goal-live", title: "Live task",
+      description: "Live task", status: "pending", assignedTo: null, agentRole: "generalist",
+      priority: 50, dependencies: [], result: null,
+      metadata: { estimatedCostCents: 0, actualCostCents: 0, maxRetries: 0, retryCount: 0,
+        timeoutMs: 60_000, createdAt: new Date().toISOString(), startedAt: null, completedAt: null },
+    };
+    const spawned = pool.spawn(task);
+    db.raw.prepare("UPDATE task_graph SET status = 'assigned', assigned_to = ?, attempt_id = ? WHERE id = ?")
+      .run(spawned.address, spawned.attemptId, "task-live");
+    const tickSpy = vi.spyOn(Orchestrator.prototype, "tick").mockImplementation(async function () {
+      expect((this as any).params.isWorkerAlive(spawned.address)).toBe(true);
+      return { phase: "executing", tasksAssigned: 0, tasksCompleted: 0, tasksFailed: 0, goalsActive: 1, agentsActive: 0 };
+    });
+    try {
+      for (let cycle = 0; cycle < 2; cycle++) {
+        const inference = new MockInferenceClient([noToolResponse("unused")]);
+        await runAgentLoop({ identity, config, db, conway, inference });
+        expect(db.getAgentState()).toBe("sleeping");
+        expect(inference.calls).toHaveLength(0);
+      }
+      expect(tickSpy).toHaveBeenCalledTimes(2);
+    } finally {
+      release();
+      await pool.shutdown();
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
   });
 });

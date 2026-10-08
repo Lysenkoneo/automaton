@@ -132,6 +132,7 @@ When calling task_done, provide:
             const result = await this.context.conway.exec(command, timeoutMs);
             return formatExecResult(result.stdout ?? "", result.stderr ?? "");
           } catch {
+            this.context.assertActive?.();
             return localExec(command, timeoutMs);
           }
         },
@@ -161,8 +162,10 @@ When calling task_done, provide:
             await this.context.conway.writeFile(confined, content);
             return `Wrote ${content.length} bytes to ${confined}`;
           } catch {
+            this.context.assertActive?.();
             try {
               await fs.mkdir(path.dirname(confined), { recursive: true });
+              this.context.assertActive?.();
               await fs.writeFile(confined, content, "utf8");
               return `Wrote ${content.length} bytes to ${confined} (local)`;
             } catch (error) {

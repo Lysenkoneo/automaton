@@ -46,6 +46,8 @@ export interface HarnessContext {
   budget: IterationBudget;
   wisdom: AccumulatedWisdom;
   abortSignal: AbortSignal;
+  attemptId?: string;
+  assertActive?: () => void;
   goalId: string;
   toolCatalog?: AutomatonTool[];
   toolContext?: ToolContext;
@@ -78,6 +80,8 @@ export interface IterationBudget {
   timeoutMs: number;
   turnsUsed: number;
   costUsedCents: number;
+  /** Set only by an executor with a complete measurement in cents. */
+  costKnown?: boolean;
   startedAt: number;
 }
 

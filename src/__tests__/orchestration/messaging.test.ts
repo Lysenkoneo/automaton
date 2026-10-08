@@ -245,7 +245,7 @@ describe("orchestration/messaging", () => {
       insertInbox(raw, {
         id: `inbox-${type}`,
         from: "0xfrom",
-        content: JSON.stringify(makeMessage({ id: `m-${type}`, type })),
+        content: JSON.stringify(makeMessage({ id: `m-${type}`, type, ...(type === "task_assignment" ? { attemptId: "attempt", content: JSON.stringify({ attemptId: "attempt" }) } : {}) })),
       });
 
       const processed = await messaging.processInbox();
@@ -399,7 +399,10 @@ describe("orchestration/messaging", () => {
       const row = raw.prepare("SELECT processed_at FROM inbox_messages WHERE id = 'm-alert'").get() as {
         processed_at: string | null;
       };
-      expect(row.processed_at).not.toBeNull();
+      expect(row.processed_at).toBeNull();
+      (messaging as any).handleAlert.mockResolvedValue(undefined);
+      messaging.releaseInboxMessage("m-alert");
+      expect((await messaging.processInbox())[0].success).toBe(true);
     });
   });
 

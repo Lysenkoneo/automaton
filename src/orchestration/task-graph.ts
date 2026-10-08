@@ -11,6 +11,7 @@ import {
   withTransaction,
 } from "../state/database.js";
 import type { GoalRow, TaskGraphRow } from "../state/database.js";
+import { assertTaskAttempt, type TaskAttempt } from "./task-attempt.js";
 
 export type TaskStatus =
   | "pending"
@@ -24,11 +25,20 @@ export type TaskStatus =
 export type GoalStatus = "active" | "completed" | "failed" | "paused";
 
 export interface TaskResult {
+  /** False when an executor threw without reporting its actual expenditure. */
+  costKnown?: boolean;
+  attemptId?: string;
   success: boolean;
   output: string;
   artifacts: string[];
   costCents: number;
   duration: number;
+}
+
+export function taskFailureResult(error: unknown): TaskResult {
+  const cost = error && typeof error === "object" ? (error as { costCents?: unknown }).costCents : undefined;
+  const known = typeof cost === "number" && Number.isFinite(cost) && cost >= 0;
+  return { success: false, output: error instanceof Error ? error.message : String(error), artifacts: [], costCents: known ? cost : 0, costKnown: known, duration: 0 };
 }
 
 export interface TaskNode {
@@ -39,6 +49,7 @@ export interface TaskNode {
   description: string;
   status: TaskStatus;
   assignedTo: string | null;
+  attemptId?: string | null;
   agentRole: string | null;
   priority: number;
   dependencies: string[];
@@ -236,11 +247,12 @@ export function getReadyTasks(db: Database): TaskNode[] {
   return getReadyTaskRows(db).map(taskRowToTaskNode);
 }
 
-export function assignTask(db: Database, taskId: string, agentAddress: string): void {
+export function assignTask(db: Database, taskId: string, agentAddress: string, attemptId = ulid()): string {
   const normalizedAddress = agentAddress.trim();
   if (!normalizedAddress) {
     throw new Error("agentAddress cannot be empty");
   }
+  if (!attemptId.trim()) throw new Error("attemptId cannot be empty");
 
   withTransaction(db, () => {
     const task = getTaskById(db, taskId);
@@ -252,13 +264,23 @@ export function assignTask(db: Database, taskId: string, agentAddress: string): 
       throw new Error(`Task ${taskId} is not assignable from status '${task.status}'`);
     }
 
+    // Keep retired IDs too: a supplied spawn token must never be reused by a
+    // later assignment, even after retry/recovery has cleared the current row.
+    db.prepare("INSERT INTO task_attempts (attempt_id, task_id, worker_address) VALUES (?, ?, ?)")
+      .run(attemptId, taskId, normalizedAddress);
+
     updateTaskStatus(db, taskId, "assigned");
-    db.prepare("UPDATE task_graph SET assigned_to = ? WHERE id = ?").run(normalizedAddress, taskId);
+    db.prepare("UPDATE task_graph SET assigned_to = ?, attempt_id = ? WHERE id = ?").run(normalizedAddress, attemptId, taskId);
   });
+  return attemptId;
 }
 
-export function completeTask(db: Database, taskId: string, result: TaskResult): void {
+export function completeTask(db: Database, taskId: string, result: TaskResult, attempt?: TaskAttempt): void {
   withTransaction(db, () => {
+    if (attempt) {
+      if (attempt.taskId !== taskId) throw new Error("Attempt task ID mismatch");
+      assertTaskAttempt(db, attempt);
+    }
     const task = getTaskById(db, taskId);
     if (!task) {
       throw new Error(`Task not found: ${taskId}`);
@@ -271,15 +293,19 @@ export function completeTask(db: Database, taskId: string, result: TaskResult): 
     updateTaskStatus(db, taskId, "completed");
     db.prepare(
       "UPDATE task_graph SET result = ?, actual_cost_cents = ?, started_at = COALESCE(started_at, ?) WHERE id = ?",
-    ).run(JSON.stringify(result), result.costCents, new Date().toISOString(), taskId);
+    ).run(JSON.stringify({ ...result, ...(task.attemptId ? { attemptId: task.attemptId } : {}) }), task.actualCostCents + result.costCents, new Date().toISOString(), taskId);
 
     unblockReadyBlockedTasks(db);
     refreshGoalStatus(db, task.goalId);
   });
 }
 
-export function failTask(db: Database, taskId: string, error: string, shouldRetry: boolean): void {
+export function failTask(db: Database, taskId: string, error: string, shouldRetry: boolean, attempt?: TaskAttempt, result?: TaskResult): void {
   withTransaction(db, () => {
+    if (attempt) {
+      if (attempt.taskId !== taskId) throw new Error("Attempt task ID mismatch");
+      assertTaskAttempt(db, attempt);
+    }
     const task = getTaskById(db, taskId);
     if (!task) {
       throw new Error(`Task not found: ${taskId}`);
@@ -290,12 +316,16 @@ export function failTask(db: Database, taskId: string, error: string, shouldRetr
     }
 
     const failureResult: TaskResult = {
+      ...result,
+      ...(task.attemptId ? { attemptId: task.attemptId } : {}),
       success: false,
       output: error,
-      artifacts: [],
-      costCents: task.actualCostCents,
-      duration: 0,
+      artifacts: result?.artifacts ?? [],
+      costCents: result?.costCents ?? task.actualCostCents,
+      duration: result?.duration ?? 0,
     };
+    const totalCost = task.actualCostCents + (result?.costCents ?? 0);
+    db.prepare("UPDATE task_graph SET actual_cost_cents=? WHERE id=?").run(totalCost, taskId);
 
     const canRetry = shouldRetry && task.retryCount < task.maxRetries;
     if (canRetry) {
@@ -305,7 +335,7 @@ export function failTask(db: Database, taskId: string, error: string, shouldRetr
 
       db.prepare(
         `UPDATE task_graph
-         SET status = ?, retry_count = ?, assigned_to = NULL, started_at = NULL, completed_at = NULL, result = ?
+         SET status = ?, retry_count = ?, assigned_to = NULL, attempt_id = NULL, started_at = NULL, completed_at = NULL, result = ?
          WHERE id = ?`,
       ).run(nextStatus, task.retryCount + 1, JSON.stringify(failureResult), taskId);
 
@@ -471,6 +501,7 @@ function taskRowToTaskNode(row: TaskGraphRow): TaskNode {
     description: row.description,
     status: row.status,
     assignedTo: row.assignedTo,
+    attemptId: row.attemptId,
     agentRole: row.agentRole,
     priority: row.priority,
     dependencies: row.dependencies,
@@ -515,6 +546,8 @@ export function normalizeTaskResult(value: unknown): TaskResult | null {
 
   return {
     success: candidate.success,
+    ...(typeof candidate.costKnown === "boolean" ? { costKnown: candidate.costKnown } : {}),
+    ...(typeof candidate.attemptId === "string" ? { attemptId: candidate.attemptId } : {}),
     output: candidate.output,
     artifacts: Array.isArray(candidate.artifacts)
       ? candidate.artifacts.filter((entry): entry is string => typeof entry === "string")

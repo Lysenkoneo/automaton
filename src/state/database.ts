@@ -46,6 +46,7 @@ import {
   MIGRATION_V9_ALTER_CHILDREN_ROLE,
   MIGRATION_V10,
   MIGRATION_V11,
+  MIGRATION_V12,
 } from "./schema.js";
 import type {
   RiskLevel,
@@ -72,6 +73,8 @@ import type {
 } from "../types.js";
 import { ulid } from "ulid";
 import { createLogger } from "../observability/logger.js";
+import { withAttemptTransaction } from "../orchestration/task-attempt.js";
+import { stageTaskAssignmentBeforeAck, stageTaskResultBeforeAck } from "../orchestration/result-inbox.js";
 
 const logger = createLogger("database");
 
@@ -102,7 +105,12 @@ export function createDatabase(dbPath: string): AutomatonDatabase {
   createSchema();
 
   // Apply migrations
-  applyMigrations(db);
+  try {
+    applyMigrations(db);
+  } catch (error) {
+    db.close();
+    throw error;
+  }
 
   // Ensure version is recorded
   const versionRow = db
@@ -490,9 +498,13 @@ export function createDatabase(dbPath: string): AutomatonDatabase {
   };
 
   const markInboxMessageProcessed = (id: string): void => {
-    db.prepare(
-      "UPDATE inbox_messages SET processed_at = datetime('now') WHERE id = ?",
-    ).run(id);
+    db.transaction(() => {
+      stageTaskAssignmentBeforeAck(db, id);
+      stageTaskResultBeforeAck(db, id);
+      db.prepare(
+        "UPDATE inbox_messages SET processed_at = datetime('now') WHERE id = ?",
+      ).run(id);
+    }).immediate();
   };
 
   // ─── Agent State ─────────────────────────────────────────────
@@ -625,6 +637,10 @@ function applyMigrations(db: DatabaseType): void {
         try { db.exec(MIGRATION_V11); } catch { /* column may already exist */ }
       },
     },
+    {
+      version: 12,
+      apply: () => db.exec(MIGRATION_V12),
+    },
   ];
 
   for (const m of migrations) {
@@ -641,8 +657,7 @@ function applyMigrations(db: DatabaseType): void {
 // ─── Exported Helpers ───────────────────────────────────────────
 
 export function withTransaction<T>(db: DatabaseType, fn: () => T): T {
-  const transaction = db.transaction(() => fn());
-  return transaction();
+  return withAttemptTransaction(db, fn);
 }
 
 export function checkpointWAL(db: DatabaseType): void {
@@ -706,6 +721,7 @@ export interface TaskGraphRow {
   description: string;
   status: TaskGraphStatus;
   assignedTo: string | null;
+  attemptId: string | null;
   agentRole: string | null;
   priority: number;
   dependencies: string[];
@@ -931,34 +947,40 @@ export function insertTask(
 ): string {
   const id = ulid();
   const now = new Date().toISOString();
-  db.prepare(
-    `INSERT INTO task_graph
-     (id, parent_id, goal_id, title, description, status, assigned_to, agent_role, priority,
-      dependencies, result, estimated_cost_cents, actual_cost_cents, max_retries, retry_count,
-      timeout_ms, created_at, started_at, completed_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(
-    id,
-    row.parentId ?? null,
-    row.goalId,
-    row.title,
-    row.description,
-    row.status ?? "pending",
-    row.assignedTo ?? null,
-    row.agentRole ?? null,
-    row.priority ?? 50,
-    JSON.stringify(row.dependencies ?? []),
-    row.result == null ? null : JSON.stringify(row.result),
-    row.estimatedCostCents ?? 0,
-    row.actualCostCents ?? 0,
-    row.maxRetries ?? 3,
-    row.retryCount ?? 0,
-    row.timeoutMs ?? 300000,
-    now,
-    row.startedAt ?? null,
-    row.completedAt ?? null,
-  );
-  return id;
+  const attemptId = row.assignedTo && (row.status === "assigned" || row.status === "running") ? ulid() : null;
+  return withTransaction(db, () => {
+    db.prepare(
+      `INSERT INTO task_graph
+       (id, parent_id, goal_id, title, description, status, assigned_to, agent_role, priority,
+        dependencies, result, estimated_cost_cents, actual_cost_cents, max_retries, retry_count,
+        timeout_ms, created_at, started_at, completed_at, attempt_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      id,
+      row.parentId ?? null,
+      row.goalId,
+      row.title,
+      row.description,
+      row.status ?? "pending",
+      row.assignedTo ?? null,
+      row.agentRole ?? null,
+      row.priority ?? 50,
+      JSON.stringify(row.dependencies ?? []),
+      row.result == null ? null : JSON.stringify(row.result),
+      row.estimatedCostCents ?? 0,
+      row.actualCostCents ?? 0,
+      row.maxRetries ?? 3,
+      row.retryCount ?? 0,
+      row.timeoutMs ?? 300000,
+      now,
+      row.startedAt ?? null,
+      row.completedAt ?? null,
+      attemptId,
+    );
+    if (attemptId) db.prepare("INSERT INTO task_attempts (attempt_id, task_id, worker_address) VALUES (?, ?, ?)")
+      .run(attemptId, id, row.assignedTo);
+    return id;
+  });
 }
 
 export function getTaskById(db: DatabaseType, id: string): TaskGraphRow | undefined {
@@ -2269,6 +2291,7 @@ function deserializeTaskGraphRow(row: any): TaskGraphRow {
     description: row.description,
     status: row.status as TaskGraphStatus,
     assignedTo: row.assigned_to ?? null,
+    attemptId: row.attempt_id ?? null,
     agentRole: row.agent_role ?? null,
     priority: row.priority,
     dependencies: safeJsonParse(row.dependencies || "[]", [] as string[], "taskGraph.dependencies"),
