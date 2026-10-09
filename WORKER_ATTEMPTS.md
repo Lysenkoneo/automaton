@@ -213,3 +213,103 @@ explicite, son résultat porte aussi `costKnown: false`. Les coûts non rapport�
 restent inconnus ; le cumul peut donc sous-estimer la dépense réelle. Ce correctif
 ne convertit pas les crédits d’inférence en cents et ne modifie pas les débits,
 le financement, Ollama ou le routage des providers.
+
+## Crédits et performance du contexte
+
+Le solde Conway confirmé nul vaut `0` ; `-1` indique un solde inconnu ou non
+interrogé. Ollama local est un mode d’inférence gratuit, distinct du solde : la
+boucle et le heartbeat conservent `-1` pour les crédits non interrogés, sans
+appliquer les restrictions financières à l’inférence locale. Le routage de la
+boucle et le contexte heartbeat utilisent alors le tier `normal`.
+Les recharges automatiques de la boucle et du heartbeat sont bloquées pour
+Ollama local et pour un solde inconnu. Une indisponibilité de l’API n’efface pas
+le délai de grâce commencé avec un solde confirmé nul. Hors Ollama local, un
+solde confirmé nul conserve le tier `critical` et les règles de recharge.
+La classification numérique existante associe toujours un solde négatif au tier
+`dead` ; les gardes explicites empêchent de traiter la sentinelle `-1` comme une
+preuve de dette ou comme un motif de recharge automatique.
+
+Le profil borné antérieur de `js-tiktoken` observait 1 229 ms pour 5 000 caractères
+répétés ; 50 000 et 500 000 dépassaient 10 secondes chacun. Pour une entrée de
+plus de 4 096 caractères, `createTokenCounter` utilise désormais le nombre
+d’octets UTF-8 comme borne supérieure : chaque token BPE contient au moins un
+octet. Le texte reste intact, les protections ne sont pas désactivées, et les
+longues entrées ne sont pas retenues dans le cache. Cette borne peut surestimer
+sensiblement les tokens et provoquer une compression plus précoce. Les petites
+entrées conservent le tokenizer exact et le cache. Le test de régression compare
+la borne au tokenizer sur des entrées ASCII et Unicode et vérifie les grandes
+entrées sans rétention. `context-hardening.test.ts` n’a pas été modifié.
+
+## Validation
+
+Les résultats ci-dessous décrivent les passages historiques de validation avant
+la séparation des commits et la correction finale des crédits. Ils ne constituent
+pas un nouveau passage complet sur les trois commits.
+
+Résultats du passage historique complet : **67 suites réussies, 1 739 tests réussis, 0 échoué,
+0 ignoré, aucune suite non exécutée ou non terminée**. Le passage complet a
+terminé en 23,36 secondes, code 0. Les passages intermédiaires ne sont pas
+additionnés.
+
+Commande des régressions ciblées, incluant heartbeat et finances :
+
+```sh
+pnpm exec vitest run src/__tests__/integration/worker-protocol.test.ts src/__tests__/orchestration/workspace-publication.test.ts src/__tests__/memory/context-manager.test.ts src/__tests__/heartbeat-scheduler.test.ts src/__tests__/financial.test.ts src/__tests__/funding.test.ts src/__tests__/low-compute.test.ts --reporter=dot
+```
+
+Résultat ciblé : **7 suites, 131 réussis, 0 échoué, 0 ignoré**, code 0.
+Détail : worker-protocol 28, workspace-publication 8, context-manager 26,
+heartbeat-scheduler 23, financial 23, funding 3, low-compute 20.
+
+Commande séparée de context-hardening, bornée à 120 secondes :
+
+```sh
+timeout --signal=INT --kill-after=5s 120s pnpm exec vitest run src/__tests__/context-hardening.test.ts --reporter=verbose
+```
+
+Résultat : **29 réussis, 0 échoué, 0 ignoré**, suite terminée en 681 ms, code 0.
+Le dépassement de délai antérieur n’est plus reproduit sur ce passage.
+
+Commande complète, incluant toutes les 25 suites auparavant restantes :
+
+```sh
+timeout --signal=INT --kill-after=5s 180s pnpm exec vitest run --reporter=dot
+```
+
+Les premiers passages ciblés ont rencontré deux attentes devenues incompatibles
+avec le backoff ou l’ordre des messages, puis trois erreurs liées à la projection
+SQL d’un champ absent dans une fixture ancienne et une attente d’ack après erreur
+de handler. La projection est maintenant compatible avec cette fixture ; les
+attentes de retry/ack reflètent le protocole demandé, et le lot de 201 messages
+utilise des identifiants ordonnés pour être déterministe. Aucun test n’a été
+supprimé. Les résultats finaux remplacent ces passages pour la validation.
+
+Les limites résiduelles sont l’isolation incomplète des effets externes et shells,
+la neutralisation manuelle des affectations historiques, les coûts non mesurés,
+la rétention sans purge, la compression éventuellement plus précoce et
+l’intervention nécessaire sur les quarantaines. Une base totalement indisponible
+ne permet pas d’enregistrer une stratégie durable de reprise.
+
+## Commits et validation des sélections
+
+Les trois commits suivants existent :
+
+- `999811c fix worker task recovery durability`
+- `5f930cd fix local ollama credit handling`
+- `d568fe4 optimize context token estimation`
+
+La sélection worker/task recovery a été testée dans une copie isolée de
+`HEAD + index` avant son commit : **16 suites, 410 tests réussis**, code 0.
+Après correction des crédits Ollama, la sélection correspondante a été testée
+dans une autre copie isolée : **8 suites, 166 tests réussis**, code 0, incluant
+heartbeat, boucle, finances, funding, low-compute et trois suites worker.
+`pnpm exec tsc --noEmit` a terminé avec le code 0 sur cette seconde sélection.
+Les contrôles `git diff --cached --check` des trois sélections ont terminé avec
+le code 0 avant leurs commits. Aucun nouveau passage de tests dédié au commit
+tokenizer n’a été exécuté lors de sa préparation ; les résultats du tokenizer
+et de context-hardening cités plus haut appartiennent au passage historique.
+
+Les validations décrites ne constituent pas une garantie de confinement des
+shells ou des effets externes déjà engagés. Une telle garantie exige encore
+l’architecture isolée décrite plus haut. Les limites techniques documentées
+restent applicables après ces commits.
