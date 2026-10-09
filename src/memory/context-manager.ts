@@ -140,6 +140,10 @@ export function createTokenCounter(): TokenCounter {
 
   const countTokens = (text: string, model?: string): number => {
     const normalizedText = text ?? "";
+    // Each BPE token consumes at least one UTF-8 byte. This upper bound avoids
+    // quadratic merging of huge repeated strings and never undercounts tokens.
+    // Do not retain large inputs as cache keys.
+    if (normalizedText.length > 4096) return Buffer.byteLength(normalizedText, "utf8");
     const key = formatCacheKey(normalizedText, model);
 
     const cached = cache.get(key);

@@ -1,3 +1,4 @@
+import { getEncoding } from "js-tiktoken";
 import { describe, expect, it } from "vitest";
 import {
   ContextManager,
@@ -54,6 +55,18 @@ describe("createTokenCounter", () => {
     expect(counter).toHaveProperty("countBatch");
     expect(counter.countTokens("hello")).toBeGreaterThan(0);
     expect(counter.countBatch(["a", "b"])).toHaveLength(2);
+  });
+
+  it("bounds large ASCII and Unicode inputs by UTF-8 bytes without retaining their contents", () => {
+    const counter = createTokenCounter();
+    const encoder = getEncoding("cl100k_base");
+    for (const text of ["x".repeat(500_000), "é😀漢".repeat(2000)]) {
+      expect(counter.countTokens(text)).toBe(Buffer.byteLength(text, "utf8"));
+      expect(counter.cache.size).toBe(0);
+    }
+    // Compare the bound against the real encoder on representative manageable inputs.
+    for (const text of ["ordinary text ".repeat(350), "é😀漢 ".repeat(800)])
+      expect(counter.countTokens(text)).toBeGreaterThanOrEqual(encoder.encode(text).length);
   });
 
   it("countTokens uses cache for repeated input", () => {
