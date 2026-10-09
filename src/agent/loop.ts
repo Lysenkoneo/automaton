@@ -93,8 +93,11 @@ export interface AgentLoopOptions {
 export async function runAgentLoop(
   options: AgentLoopOptions,
 ): Promise<void> {
-  const { identity, config, db, conway, inference, social, skills, policyEngine, spendTracker, onStateChange, onTurnComplete, ollamaBaseUrl } =
+  const { identity, config, db, conway, inference, social, skills, policyEngine, spendTracker, onStateChange, onTurnComplete } =
     options;
+  const ollamaBaseUrl = options.ollamaBaseUrl ?? config.ollamaBaseUrl;
+  const usingLocalOllama = !!ollamaBaseUrl &&
+    /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(?::\d+)?(?:\/|$)/i.test(ollamaBaseUrl);
 
   const builtinTools = createBuiltinTools(identity.sandboxId);
   const installedTools = loadInstalledTools(db);
@@ -162,6 +165,10 @@ export async function runAgentLoop(
         "inference-providers.json",
       );
       const registry = ProviderRegistry.fromConfig(providersPath);
+        if (ollamaBaseUrl) {
+          const ollamaModel = process.env.OLLAMA_MODEL || "qwen2.5:7b";
+          registry.configureLocalOllama(ollamaModel, ollamaBaseUrl);
+        }
 
       // If OPENAI_BASE_URL was set (Conway fallback), update the default
       // provider's baseUrl so the OpenAI client points to Conway Compute.
@@ -358,7 +365,7 @@ export async function runAgentLoop(
   onStateChange?.("waking");
 
   // Get financial state
-  let financial = await getFinancialState(conway, identity.address, db, config.chainType || identity.chainType || "evm");
+  let financial = await getFinancialState(conway, identity.address, db, config.chainType || identity.chainType || "evm", ollamaBaseUrl);
 
   // Check if this is the first run
   const isFirstRun = db.getTurnCount() === 0;
@@ -426,12 +433,17 @@ export async function runAgentLoop(
       }
 
       // Refresh financial state periodically
-      financial = await getFinancialState(conway, identity.address, db, config.chainType || identity.chainType || "evm");
+      financial = await getFinancialState(conway, identity.address, db, config.chainType || identity.chainType || "evm", ollamaBaseUrl);
 
       // Check survival tier
       // api_unreachable: creditsCents === -1 means API failed with no cache.
       // Do NOT kill the agent; continue in low-compute mode and retry next tick.
-      if (financial.creditsCents === -1) {
+      if (usingLocalOllama) {
+        // Free local inference is independent of the unqueried Conway balance.
+        db.setAgentState("running");
+        onStateChange?.("running");
+        inference.setLowComputeMode(false);
+      } else if (financial.creditsCents === -1) {
         log(config, "[API_UNREACHABLE] Balance API unreachable, continuing in low-compute mode.");
         inference.setLowComputeMode(true);
       } else {
@@ -441,7 +453,8 @@ export async function runAgentLoop(
         // available, buy credits NOW — before attempting inference.
         // This prevents the agent from dying mid-loop while waiting for
         // the heartbeat to fire. Uses a 60s cooldown to avoid hammering.
-        if ((tier === "critical" || tier === "low_compute") && financial.usdcBalance >= 5) {
+        if (!usingLocalOllama && financial.creditsCents !== -1 &&
+            (tier === "critical" || tier === "low_compute") && financial.usdcBalance >= 5) {
           const INLINE_TOPUP_COOLDOWN_MS = 60_000;
           const lastInlineTopup = db.getKV("last_inline_topup_attempt");
           const cooldownExpired = !lastInlineTopup ||
@@ -461,7 +474,7 @@ export async function runAgentLoop(
                 log(config, `[AUTO-TOPUP] Bought $${topupResult.amountUsd} credits from USDC mid-loop`);
                 // Re-fetch financial state after topup so the rest of
                 // the turn sees the updated balance.
-                financial = await getFinancialState(conway, identity.address, db, config.chainType || identity.chainType || "evm");
+                financial = await getFinancialState(conway, identity.address, db, config.chainType || identity.chainType || "evm", ollamaBaseUrl);
               }
             } catch (err: any) {
               logger.warn(`Inline auto-topup failed: ${err.message}`);
@@ -596,10 +609,14 @@ export async function runAgentLoop(
       pendingInput = undefined;
 
       // ── Inference Call (via router when available) ──
-      const survivalTier = getSurvivalTier(financial.creditsCents);
+      const survivalTier = usingLocalOllama ? "normal" : getSurvivalTier(financial.creditsCents);
       log(config, `[THINK] Routing inference (tier: ${survivalTier}, model: ${inference.getDefaultModel()})...`);
 
-      const inferenceTools = toolsToInferenceFormat(tools);
+const inferenceToolSource = usingLocalOllama
+  ? tools.filter((tool) => tool.category !== "conway")
+  : tools;
+
+const inferenceTools = toolsToInferenceFormat(inferenceToolSource);
       const routerResult = await inferenceRouter.route(
         {
           messages: messages,
@@ -948,9 +965,25 @@ async function getFinancialState(
   address: string,
   db?: AutomatonDatabase,
   chainType?: string,
+  ollamaBaseUrl?: string,
 ): Promise<FinancialState> {
   let creditsCents = _lastKnownCredits;
   let usdcBalance = _lastKnownUsdc;
+
+  const usingLocalOllama =
+    !!ollamaBaseUrl &&
+    /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(?::\d+)?(?:\/|$)/i.test(
+      ollamaBaseUrl,
+    );
+
+  if (usingLocalOllama) {
+    return {
+      // Conway balance was not queried; zero must mean a confirmed balance.
+      creditsCents: -1,
+      usdcBalance: _lastKnownUsdc,
+      lastChecked: new Date().toISOString(),
+    };
+  }
 
   try {
     creditsCents = await conway.getCreditsBalance();
@@ -965,7 +998,7 @@ async function getFinancialState(
           const parsed = JSON.parse(cached);
           logger.warn("Balance API failed, using cached balance");
           return {
-            creditsCents: parsed.creditsCents ?? 0,
+            creditsCents: parsed.creditsCents ?? -1,
             usdcBalance: parsed.usdcBalance ?? 0,
             lastChecked: new Date().toISOString(),
           };

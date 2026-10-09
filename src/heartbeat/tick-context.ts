@@ -43,16 +43,26 @@ export async function buildTickContext(
   config: HeartbeatConfig,
   walletAddress?: string,
   chainType?: string,
+  ollamaBaseUrl?: string,
 ): Promise<TickContext> {
   const tickId = generateTickId();
   const startedAt = new Date();
 
-  // Fetch balances ONCE
-  let creditBalance = 0;
-  try {
-    creditBalance = await conway.getCreditsBalance();
-  } catch (err: any) {
-    logger.error("Failed to fetch credit balance", err instanceof Error ? err : undefined);
+  // Fetch Conway credits only when using a non-local inference backend.
+  // Ollama runs locally and does not require Conway compute credits.
+  const usingLocalOllama =
+    !!ollamaBaseUrl &&
+    /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(?::\d+)?(?:\/|$)/i.test(
+      ollamaBaseUrl,
+    );
+
+  let creditBalance = -1;
+  if (!usingLocalOllama) {
+    try {
+      creditBalance = await conway.getCreditsBalance();
+    } catch (err: any) {
+      logger.error("Failed to fetch credit balance", err instanceof Error ? err : undefined);
+    }
   }
 
   let usdcBalance = 0;
@@ -65,7 +75,8 @@ export async function buildTickContext(
     }
   }
 
-  const survivalTier = getSurvivalTier(creditBalance);
+  // Local inference is free; an unqueried balance must not imply debt.
+  const survivalTier = usingLocalOllama ? "normal" : getSurvivalTier(creditBalance);
   const lowComputeMultiplier = config.lowComputeMultiplier ?? 4;
 
   return {

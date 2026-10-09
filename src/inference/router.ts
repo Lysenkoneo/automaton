@@ -196,6 +196,23 @@ export class InferenceRouter {
 
     const tierRank = TIER_ORDER[tier] ?? 0;
 
+    // Prefer free local Ollama models for critical/dead operation.
+    // This keeps local-only agents independent of Conway inference credits.
+    if (tier === "critical" || tier === "dead") {
+      const localModel = this.registry
+        .getAvailable("critical")
+        .find(
+          (entry) =>
+            entry.provider === "ollama" &&
+            entry.costPer1kInput === 0 &&
+            entry.costPer1kOutput === 0,
+        );
+
+      if (localModel) {
+        return localModel;
+      }
+    }
+
     // 1. Try routing-matrix candidates
     const preference = this.getPreference(tier, taskType);
     if (preference && preference.candidates.length > 0) {

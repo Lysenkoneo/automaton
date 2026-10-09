@@ -96,6 +96,7 @@ export class DurableScheduler {
         this.config,
         this.legacyContext.identity.address,
         this.legacyContext.identity.chainType,
+        this.legacyContext.config.ollamaBaseUrl,
       );
 
       // Get tasks that are due

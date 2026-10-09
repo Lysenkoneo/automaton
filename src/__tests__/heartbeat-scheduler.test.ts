@@ -6,6 +6,11 @@
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { DurableScheduler } from "../heartbeat/scheduler.js";
+import { BUILTIN_TASKS } from "../heartbeat/tasks.js";
+import { bootstrapTopup } from "../conway/topup.js";
+
+vi.mock("../conway/topup.js", () => ({ bootstrapTopup: vi.fn().mockResolvedValue({ success: false }) }));
+
 import { buildTickContext } from "../heartbeat/tick-context.js";
 import {
   MockConwayClient,
@@ -373,6 +378,62 @@ describe("DurableScheduler", () => {
       expect(ctx.db).toBe(rawDb);
     });
 
+    it("keeps local Ollama independent of credit fetching", async () => {
+      const fetch = vi.spyOn(conway, "getCreditsBalance").mockRejectedValue(new Error("should not fetch"));
+      const ctx = await buildTickContext(rawDb, conway, DEFAULT_HB_CONFIG, undefined, undefined, "http://localhost:11434");
+      expect(fetch).not.toHaveBeenCalled();
+      expect(ctx.creditBalance).toBe(-1);
+      expect(ctx.survivalTier).toBe("normal");
+    });
+
+    it.each([
+      ["http://localhost:11434", 0],
+      ["http://localhost:11434", -1],
+      [undefined, -1],
+    ])("never recharges for local inference or unknown credits (%s, %s)", async (url, credits) => {
+      const legacy = createLegacyContext(db, conway);
+      legacy.config.ollamaBaseUrl = url;
+      const ctx = await buildTickContext(rawDb, conway, DEFAULT_HB_CONFIG, undefined, undefined, url);
+      ctx.creditBalance = credits as number;
+      ctx.survivalTier = credits === 0 ? "critical" : "dead";
+      ctx.usdcBalance = 100;
+      vi.mocked(bootstrapTopup).mockClear();
+      expect(await BUILTIN_TASKS.check_usdc_balance(ctx, legacy)).toEqual({ shouldWake: false });
+      expect(bootstrapTopup).not.toHaveBeenCalled();
+      expect(db.getKV("last_auto_topup_attempt")).toBeUndefined();
+    });
+
+    it("keeps the zero-credit grace timer through an API outage", async () => {
+      const legacy = createLegacyContext(db, conway);
+      const ctx = await buildTickContext(rawDb, conway, DEFAULT_HB_CONFIG);
+      ctx.creditBalance = -1;
+      ctx.survivalTier = "dead";
+      const since = new Date(Date.now() - 120_000).toISOString();
+      db.setKV("zero_credits_since", since);
+      db.setKV("prev_credit_tier", "critical");
+      await BUILTIN_TASKS.check_credits(ctx, legacy);
+      expect(db.getKV("zero_credits_since")).toBe(since);
+      expect(db.getKV("prev_credit_tier")).toBe("critical");
+    });
+
+    it("still recharges with confirmed zero credits and USDC outside local inference", async () => {
+      const legacy = createLegacyContext(db, conway);
+      const ctx = await buildTickContext(rawDb, conway, DEFAULT_HB_CONFIG);
+      ctx.creditBalance = 0;
+      ctx.survivalTier = "critical";
+      ctx.usdcBalance = 100;
+      vi.mocked(bootstrapTopup).mockClear();
+      await BUILTIN_TASKS.check_usdc_balance(ctx, legacy);
+      expect(bootstrapTopup).toHaveBeenCalledWith(expect.objectContaining({ creditsCents: 0 }));
+    });
+
+    it.each([[0, "critical"], [-2, "dead"]] as const)("preserves a confirmed balance %s and tier %s", async (balance, tier) => {
+      conway.getCreditsBalance = async () => balance;
+      const ctx = await buildTickContext(rawDb, conway, DEFAULT_HB_CONFIG);
+      expect(ctx.creditBalance).toBe(balance);
+      expect(ctx.survivalTier).toBe(tier);
+    });
+
     it("handles API failure gracefully", async () => {
       // Make getCreditsBalance throw
       conway.getCreditsBalance = async () => {
@@ -385,9 +446,9 @@ describe("DurableScheduler", () => {
         DEFAULT_HB_CONFIG,
       );
 
-      // Should default to 0 credits (critical tier — zero is broke, not dead)
-      expect(ctx.creditBalance).toBe(0);
-      expect(ctx.survivalTier).toBe("critical");
+      // Preserve the existing unknown-balance sentinel; do not invent confirmed zero credits.
+      expect(ctx.creditBalance).toBe(-1);
+      expect(ctx.survivalTier).toBe("dead");
     });
   });
 

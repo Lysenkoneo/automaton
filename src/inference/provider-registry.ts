@@ -269,7 +269,62 @@ export class ProviderRegistry {
     }
   }
 
-  static fromConfig(configPath: string): ProviderRegistry {
+  configureLocalOllama(modelId: string, baseUrl: string): void {
+    const local = this.providers.find((provider) => provider.id === "local");
+    if (!local) return;
+
+    local.enabled = true;
+    local.baseUrl = `${baseUrl.replace(/\/$/, "")}/v1`;
+    local.models = [
+      {
+        id: modelId,
+        tier: "reasoning",
+        contextWindow: 32768,
+        maxOutputTokens: 4096,
+        costPerInputToken: 0,
+        costPerOutputToken: 0,
+        supportsTools: true,
+        supportsVision: false,
+        supportsStreaming: true,
+      },
+      {
+        id: modelId,
+        tier: "fast",
+        contextWindow: 32768,
+        maxOutputTokens: 4096,
+        costPerInputToken: 0,
+        costPerOutputToken: 0,
+        supportsTools: true,
+        supportsVision: false,
+        supportsStreaming: true,
+      },
+      {
+        id: modelId,
+        tier: "cheap",
+        contextWindow: 32768,
+        maxOutputTokens: 4096,
+        costPerInputToken: 0,
+        costPerOutputToken: 0,
+        supportsTools: true,
+        supportsVision: false,
+        supportsStreaming: true,
+      },
+    ];
+
+    this.tierDefaults.reasoning = {
+      preferredProvider: "local",
+      fallbackOrder: [],
+    };
+    this.tierDefaults.fast = {
+      preferredProvider: "local",
+      fallbackOrder: [],
+    };
+    this.tierDefaults.cheap = {
+      preferredProvider: "local",
+      fallbackOrder: [],
+    };
+  }
+static fromConfig(configPath: string): ProviderRegistry {
     let providers = DEFAULT_PROVIDERS.map((provider) => deepCloneProvider(provider));
     let tierDefaults = DEFAULT_TIER_DEFAULTS;
     let emergencyStopCredits = DEFAULT_EMERGENCY_STOP_CREDITS;

@@ -14,6 +14,16 @@ const MAX_EXEC_TIMEOUT_MS = 30_000;
 const MAX_READ_SIZE = 10_000;
 const MAX_EXEC_OUTPUT = 16_000;
 const MAX_SOCIAL_MESSAGES = 20;
+const LOCAL_OLLAMA_BLOCKED_TOOLS = new Set([
+  "check_credits",
+  "transfer_credits",
+  "discover_agents",
+  "check_reputation",
+  "search_domains",
+  "register_domain",
+  "manage_dns",
+  "x402_fetch",
+]);
 const GENERAL_WRAPPED_TOOL_ALLOWLIST = new Set([
   "expose_port",
   "remove_port",
@@ -286,10 +296,21 @@ When calling task_done, provide:
       ...customToolNames,
       ...aliasTools.map((tool) => tool.name),
     ]);
+    const usingLocalOllama =
+  !!this.context.config.ollamaBaseUrl &&
+  /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(?::\d+)?(?:\/|$)/i.test(
+    this.context.config.ollamaBaseUrl,
+  );
+
     const wrappedTools = toolCatalog
-      .filter((tool) => GENERAL_WRAPPED_TOOL_ALLOWLIST.has(tool.name))
-      .filter((tool) => !reservedToolNames.has(tool.name))
-      .map((tool) => this.createWrappedTool(tool, toolCatalog));
+  .filter((tool) => GENERAL_WRAPPED_TOOL_ALLOWLIST.has(tool.name))
+  .filter(
+    (tool) =>
+      !usingLocalOllama ||
+      !LOCAL_OLLAMA_BLOCKED_TOOLS.has(tool.name),
+  )
+  .filter((tool) => !reservedToolNames.has(tool.name))
+  .map((tool) => this.createWrappedTool(tool, toolCatalog));
 
     return [...customTools, ...aliasTools, ...wrappedTools];
   }

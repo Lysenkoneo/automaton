@@ -31,6 +31,9 @@ vi.mock("../conway/x402.js", async (importOriginal) => ({
   getUsdcBalance: async () => 0,
 }));
 
+vi.mock("../ollama/discover.js", () => ({ discoverOllamaModels: vi.fn() }));
+vi.mock("../conway/topup.js", () => ({ bootstrapTopup: vi.fn() }));
+
 describe("Agent Loop", () => {
   let db: AutomatonDatabase;
   let conway: MockConwayClient;
@@ -47,6 +50,39 @@ describe("Agent Loop", () => {
   afterEach(() => {
     vi.restoreAllMocks();
     db.close();
+  });
+
+  it.each(["config", "option"])("runs local Ollama without credit restrictions or topup via %s", async (source) => {
+    const url = "http://localhost:11434";
+    if (source === "config") config.ollamaBaseUrl = url;
+    db.setKV("last_known_balance", JSON.stringify({ creditsCents: 0, usdcBalance: 100 }));
+    const fetch = vi.spyOn(conway, "getCreditsBalance").mockRejectedValue(new Error("unavailable"));
+    const inference = new MockInferenceClient([noToolResponse("Done")]);
+    const lowCompute = vi.spyOn(inference, "setLowComputeMode");
+    const states: AgentState[] = [];
+    const { bootstrapTopup } = await import("../conway/topup.js");
+    vi.mocked(bootstrapTopup).mockClear();
+    await runAgentLoop({ identity, config, db, conway, inference,
+      ...(source === "option" ? { ollamaBaseUrl: url } : {}),
+      onStateChange: state => states.push(state) });
+    expect(fetch).not.toHaveBeenCalled();
+    expect(states).not.toContain("critical");
+    expect(states).not.toContain("low_compute");
+    expect(lowCompute).not.toHaveBeenCalledWith(true);
+    expect(bootstrapTopup).not.toHaveBeenCalled();
+  });
+
+  it("does not top up when an API outage leaves cached credits unknown", async () => {
+    db.setKV("last_known_balance", JSON.stringify({ usdcBalance: 100 }));
+    vi.spyOn(conway, "getCreditsBalance").mockRejectedValue(new Error("unavailable"));
+    const inference = new MockInferenceClient([noToolResponse("Done")]);
+    const lowCompute = vi.spyOn(inference, "setLowComputeMode");
+    const { bootstrapTopup } = await import("../conway/topup.js");
+    vi.mocked(bootstrapTopup).mockClear();
+    await runAgentLoop({ identity, config, db, conway, inference });
+    expect(lowCompute).toHaveBeenCalledWith(true);
+    expect(bootstrapTopup).not.toHaveBeenCalled();
+    expect(db.getKV("last_inline_topup_attempt")).toBeUndefined();
   });
 
   it("exec tool runs and is persisted", async () => {
