@@ -27,6 +27,53 @@ vi.mock("../registry/erc8004.js", () => ({
 
 // ─── Risk Level Classification ──────────────────────────────────
 
+describe("Child tool identifiers", () => {
+  it("lists the exact child ID accepted by verification and funding while retaining guards", async () => {
+    const db = createTestDb();
+    try {
+      const conway = new MockConwayClient();
+      const ctx: ToolContext = {
+        identity: createTestIdentity(), config: createTestConfig(), db, conway,
+        inference: new MockInferenceClient(),
+      };
+      const tools = createBuiltinTools("test-sandbox-id");
+      const childId = "child-exact-id";
+      const address = "0x1111111111111111111111111111111111111111";
+      db.insertChild({
+        id: childId, name: "Child", address, sandboxId: "child-sandbox", status: "wallet_verified",
+        genesisPrompt: "private child prompt", creatorMessage: "private message", fundedAmountCents: 0,
+        createdAt: new Date().toISOString(),
+      });
+      const listing = await tools.find((tool) => tool.name === "list_children")!.execute({}, ctx);
+      const listedId = listing.match(/child_id:([^\s]+)/)?.[1];
+      expect(listedId).toBe(childId);
+      expect(listing).not.toContain("private child prompt");
+      expect(listing).not.toContain("private message");
+
+      const lookup = vi.spyOn(db, "getChildById");
+      const scoped = vi.spyOn(conway, "createScopedClient");
+      const verify = tools.find((tool) => tool.name === "verify_child_constitution")!;
+      const verified = await verify.execute({ child_id: listedId }, ctx);
+      expect(lookup).toHaveBeenCalledWith(childId);
+      expect(scoped).toHaveBeenCalledWith("child-sandbox");
+      expect(JSON.parse(verified)).toEqual({ valid: false, detail: "no stored constitution hash found" });
+
+      const transfer = vi.spyOn(conway, "transferCredits");
+      const fund = tools.find((tool) => tool.name === "fund_child")!;
+      expect(await fund.execute({ child_id: listedId, amount_cents: 100 }, ctx)).toContain("Funded child Child");
+      expect(transfer).toHaveBeenCalledWith(address, 100, `fund child ${childId}`);
+      expect(db.getChildById(childId)?.fundedAmountCents).toBe(100);
+      expect(await verify.execute({ child_id: "missing" }, ctx)).toContain("BLOCKED");
+      expect(await fund.execute({ child_id: "missing", amount_cents: 100 }, ctx)).toContain("BLOCKED");
+      expect(await fund.execute({ child_id: listedId, amount_cents: 0 }, ctx)).toContain("Blocked");
+      expect(transfer).toHaveBeenCalledTimes(1);
+      expect(scoped).toHaveBeenCalledTimes(1);
+    } finally {
+      db.close();
+    }
+  });
+});
+
 describe("Tool Risk Level Classification", () => {
   let tools: AutomatonTool[];
 

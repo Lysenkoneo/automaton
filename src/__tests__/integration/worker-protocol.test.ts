@@ -213,6 +213,70 @@ describe("integration/worker attempt protocol", () => {
     expect(resumed.getPendingTaskResults()).toHaveLength(0);
   });
 
+  it("discards a queued result for an inactive goal without applying or reassigning its task", async () => {
+    const parent = open("inactive.db", createTestIdentity().address);
+    const child = open("child.db", "0xchild");
+    const taskId = ready(parent);
+    const token = assignTask(parent.raw, taskId, "0xchild");
+    const goalId = getTaskById(parent.raw, taskId)!.goalId;
+    parent.raw.prepare("UPDATE goals SET status='completed' WHERE id=?").run(goalId);
+    const producer = new ColonyMessaging(new LocalDBTransport(child, () => parent), child);
+    await producer.send(producer.createMessage({
+      type: "task_result", to: createTestIdentity().address, taskId, attemptId: token,
+      content: JSON.stringify({ taskId, result: { ...RESULT, costCents: 7 } }),
+    }));
+    const messaging = new ColonyMessaging(new LocalDBTransport(parent), parent);
+    const tick = await orchestrator(parent, messaging, () => false).tick();
+
+    expect(tick).toMatchObject({ phase: "idle", tasksCompleted: 0, tasksAssigned: 0 });
+    expect(getTaskById(parent.raw, taskId)).toMatchObject({ status: "assigned", attemptId: token, actualCostCents: 0 });
+    expect(messaging.getPendingTaskResults()).toHaveLength(0);
+  });
+
+  it.each(["assigned", "running"])("retains a valid result during pause and applies it once on resume from %s", async (status) => {
+    let parent = open("paused.db", createTestIdentity().address);
+    const child = open("child.db", "0xchild");
+    const taskId = ready(parent);
+    const token = assignTask(parent.raw, taskId, "0xchild");
+    const goalId = getTaskById(parent.raw, taskId)!.goalId;
+    parent.raw.prepare("UPDATE task_graph SET status=? WHERE id=?").run(status, taskId);
+    parent.raw.prepare("UPDATE goals SET status='paused' WHERE id=?").run(goalId);
+    const producer = new ColonyMessaging(new LocalDBTransport(child, () => parent), child);
+    const message = producer.createMessage({
+      type: "task_result", to: createTestIdentity().address, taskId, attemptId: token,
+      content: JSON.stringify({ taskId, result: { ...RESULT, costCents: 7 } }),
+    });
+    await producer.send(message);
+    const messaging = new ColonyMessaging(new LocalDBTransport(parent), parent);
+    const paused = orchestrator(parent, messaging, () => false);
+    expect(await paused.tick()).toMatchObject({ phase: "idle", tasksCompleted: 0, tasksAssigned: 0 });
+    expect(getTaskById(parent.raw, taskId)).toMatchObject({ status, attemptId: token, actualCostCents: 0 });
+    expect(messaging.getPendingTaskResults()).toHaveLength(1);
+    expect((await paused.tick()).phase).toBe("idle");
+    expect(messaging.getPendingTaskResults()).toHaveLength(1);
+
+    parent.close(); databases.splice(databases.indexOf(parent), 1);
+    parent = open("paused.db", createTestIdentity().address);
+    const resumed = new ColonyMessaging(new LocalDBTransport(parent), parent);
+    expect(resumed.getPendingTaskResults()).toHaveLength(1);
+    parent.raw.prepare("UPDATE goals SET status='active' WHERE id=?").run(goalId);
+    const orc = orchestrator(parent, resumed, () => false);
+    expect((await orc.tick()).phase).toBe("classifying");
+    expect((await orc.tick()).phase).toBe("executing");
+    expect(await orc.tick()).toMatchObject({ phase: "complete", tasksCompleted: 1, tasksAssigned: 0 });
+    expect(getTaskById(parent.raw, taskId)).toMatchObject({ status: "completed", attemptId: token, actualCostCents: 7 });
+    expect(resumed.getPendingTaskResults()).toHaveLength(0);
+    expect(parent.raw.prepare("SELECT status FROM goals WHERE id=?").get(goalId)).toEqual({ status: "completed" });
+
+    await producer.send(message);
+    const source = parent.raw.prepare("SELECT id FROM inbox_messages LIMIT 1").get() as { id: string };
+    parent.markInboxMessageProcessed(source.id);
+    parent.setKV("orchestrator.state", JSON.stringify({ phase: "executing", goalId, replanCount: 0 }));
+    expect(await orc.tick()).toMatchObject({ phase: "idle", tasksCompleted: 0, tasksAssigned: 0 });
+    expect(resumed.getPendingTaskResults()).toHaveLength(0);
+    expect(getTaskById(parent.raw, taskId)?.actualCostCents).toBe(7);
+  });
+
   it("rolls completion and dequeue back together and retries a storage failure without failing the goal", async () => {
     const parent = open("rollback.db", createTestIdentity().address);
     const child = open("child.db", "0xchild");

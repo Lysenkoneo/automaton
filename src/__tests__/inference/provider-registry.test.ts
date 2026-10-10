@@ -403,4 +403,51 @@ describe("ProviderRegistry", () => {
 
     expect(openAiCtor).toHaveBeenCalledTimes(4);
   });
+
+  it("configures a single Ollama provider for every model tier", () => {
+    const registry = createRegistryFromDefaults();
+    registry.configureLocalOllama("qwen2.5:7b", "http://localhost:11434/");
+
+    expect(registry.getProviders()).toHaveLength(4);
+    const locals = registry.getProviders().filter((provider) => provider.id === "local");
+    expect(locals).toHaveLength(1);
+    expect(locals[0]).toMatchObject({ enabled: true, baseUrl: "http://localhost:11434/v1" });
+    for (const tier of ["reasoning", "fast", "cheap"] as const) {
+      expect(registry.resolveModel(tier)).toMatchObject({
+        provider: { id: "local" },
+        model: { id: "qwen2.5:7b", tier, costPerInputToken: 0, costPerOutputToken: 0 },
+      });
+    }
+  });
+
+  it.each([
+    [undefined, "legacy-key", "legacy-key"],
+    ["", "legacy-key", "legacy-key"],
+    ["ollama-key", undefined, "ollama-key"],
+    ["ollama-key", "legacy-key", "ollama-key"],
+    [undefined, undefined, "local"],
+    ["", "", "local"],
+  ])("resolves default local keys with OLLAMA=%s and LOCAL=%s", (ollamaKey, localKey, expected) => {
+    delete process.env.OLLAMA_API_KEY;
+    delete process.env.LOCAL_API_KEY;
+    if (ollamaKey !== undefined) process.env.OLLAMA_API_KEY = ollamaKey;
+    if (localKey !== undefined) process.env.LOCAL_API_KEY = localKey;
+    const registry = createRegistryFromDefaults();
+    registry.configureLocalOllama("qwen2.5:7b", "http://localhost:11434");
+    const resolved = registry.getModel("local", "qwen2.5:7b");
+    expect(resolved.client).toMatchObject({ options: { apiKey: expected } });
+  });
+
+  it("does not apply the legacy fallback to custom local providers", () => {
+    process.env.LOCAL_API_KEY = "legacy-key";
+    process.env.OLLAMA_API_KEY = "ollama-key";
+    delete process.env.CUSTOM_LOCAL_KEY;
+    const local = createRegistryFromDefaults().getProviders().find((provider) => provider.id === "local")!;
+    const registry = ProviderRegistry.fromConfig(makeTempConfigFile({
+      providers: [{ ...local, enabled: true, apiKeyEnvVar: "CUSTOM_LOCAL_KEY" }],
+    }));
+    expect(registry.getModel("local", "qwen2.5:7b").client).toMatchObject({ options: { apiKey: "local" } });
+    process.env.CUSTOM_LOCAL_KEY = "custom-key";
+    expect(registry.getModel("local", "qwen2.5:7b").client).toMatchObject({ options: { apiKey: "custom-key" } });
+  });
 });

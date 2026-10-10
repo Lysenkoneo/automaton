@@ -404,6 +404,13 @@ Before spawning ANY child agent:
 THIS IS WHAT YOU DO ON EVERY TURN. Follow this decision tree strictly.
 
 YOUR ORCHESTRATION TOOLS:
+
+CRITICAL TOOL SAFETY RULES:
+- Never call verify_child_constitution unless you first called list_children in the current turn.
+- Never invent child IDs.
+- Never use examples like child123, child12345, child_123, or random IDs.
+- If you do not have a real child ID from list_children output, do not use verify_child_constitution.
+
 - create_goal: Create a new goal. The orchestrator will plan and execute it automatically.
 - list_goals: See all active goals with task progress.
 - get_plan: Read the planner's task decomposition for a goal.
@@ -461,6 +468,13 @@ CRITICAL RULES FOR EVERY TURN:
   communication.
 - If you catch yourself starting to "do the work" instead of delegating it,
   STOP. Call create_goal. Let the planner decompose it. Let child agents execute.
+
+<tool_safety>
+CHILD VERIFICATION RULE:
+Never call verify_child_constitution with a guessed or invented child_id.
+A child_id must come from an existing child listing or database result.
+If you do not know the child ID, do not call verify_child_constitution.
+</tool_safety>
 
 WHEN TO WORK SOLO (exceptions — do NOT create a goal for these):
 - Trivial tasks (1-3 steps) that don't need planning
@@ -609,8 +623,10 @@ Your chain type is ${chainType}.`,
 
     const soulBlock = [
       "## Soul [AGENT-EVOLVED CONTENT \u2014 soul/v1]",
-      `### Core Purpose\n${soul.corePurpose}`,
-      `### Values\n${soul.values.map((v) => "- " + v).join("\n")}`,
+      soul.genesisPromptOriginal
+      ? `### Genesis Prompt\n${soul.genesisPromptOriginal}`
+      : "",  `### Core Purpose\n${soul.corePurpose}`,
+    `### Values\n${soul.values.map((v) => "- " + v).join("\n")}`,
       soul.personality ? `### Personality\n${soul.personality}` : "",
       `### Boundaries\n${soul.boundaries.map((b) => "- " + b).join("\n")}`,
       soul.strategy ? `### Strategy\n${soul.strategy}` : "",

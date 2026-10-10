@@ -292,6 +292,47 @@ describe("orchestration/Orchestrator", () => {
       expect(result.phase).toBe("executing");
     });
 
+    it("releases an executing state when its goal is already completed", async () => {
+      const completedGoalId = insertGoal(db, { status: "completed" });
+      const activeGoalId = insertGoal(db, { title: "New active goal", status: "active" });
+      setOrchestratorState(db, {
+        phase: "executing",
+        goalId: completedGoalId,
+        replanCount: 0,
+        failedTaskId: null,
+        failedError: null,
+      });
+
+      const orc = makeOrchestrator(db);
+      const first = await orc.tick();
+      expect(first.phase).toBe("idle");
+
+      const second = await orc.tick();
+      expect(second.phase).toBe("classifying");
+      const savedAfterSecondTick = db.prepare(
+        "SELECT value FROM kv WHERE key = ?",
+      ).get("orchestrator.state") as { value: string };
+      expect(JSON.parse(savedAfterSecondTick.value).goalId).toBe(activeGoalId);
+    });
+
+    it("returns an executing goal with no tasks to classifying", async () => {
+      const goalId = insertGoal(db, { title: "Goal without tasks", status: "active" });
+      setOrchestratorState(db, {
+        phase: "executing",
+        goalId,
+        replanCount: 0,
+        failedTaskId: null,
+        failedError: null,
+      });
+
+      const result = await makeOrchestrator(db).tick();
+      expect(result.phase).toBe("classifying");
+      const savedAfterTick = db.prepare(
+        "SELECT value FROM kv WHERE key = ?",
+      ).get("orchestrator.state") as { value: string };
+      expect(JSON.parse(savedAfterTick.value).goalId).toBe(goalId);
+    });
+
     it("complete phase resets to idle", async () => {
       const goalId = insertGoal(db, { status: "completed" });
       setOrchestratorState(db, { phase: "complete", goalId, replanCount: 0, failedTaskId: null, failedError: null });

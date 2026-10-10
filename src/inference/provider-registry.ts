@@ -206,15 +206,15 @@ const DEFAULT_PROVIDERS: ProviderConfig[] = [
   },
   {
     id: "local",
-    name: "Local (Ollama/vLLM)",
+    name: "Ollama Local",
     baseUrl: "http://localhost:11434/v1",
-    apiKeyEnvVar: "LOCAL_API_KEY",
+    apiKeyEnvVar: "OLLAMA_API_KEY",
     models: [
       {
-        id: "llama3.3:70b",
-        tier: "fast",
-        contextWindow: 131072,
-        maxOutputTokens: 8192,
+        id: "qwen2.5:7b",
+        tier: "reasoning",
+        contextWindow: 32768,
+        maxOutputTokens: 4096,
         costPerInputToken: 0,
         costPerOutputToken: 0,
         supportsTools: true,
@@ -222,9 +222,20 @@ const DEFAULT_PROVIDERS: ProviderConfig[] = [
         supportsStreaming: true,
       },
       {
-        id: "llama3.1:8b",
+        id: "qwen2.5:7b",
+        tier: "fast",
+        contextWindow: 32768,
+        maxOutputTokens: 4096,
+        costPerInputToken: 0,
+        costPerOutputToken: 0,
+        supportsTools: true,
+        supportsVision: false,
+        supportsStreaming: true,
+      },
+      {
+        id: "qwen2.5:7b",
         tier: "cheap",
-        contextWindow: 131072,
+        contextWindow: 32768,
         maxOutputTokens: 4096,
         costPerInputToken: 0,
         costPerOutputToken: 0,
@@ -234,7 +245,7 @@ const DEFAULT_PROVIDERS: ProviderConfig[] = [
       },
     ],
     maxRequestsPerMinute: 100,
-    maxTokensPerMinute: 200000,
+    maxTokensPerMinute: 100000,
     priority: 10,
     enabled: false,
   },
@@ -250,6 +261,7 @@ export class ProviderRegistry {
     providers: ProviderConfig[],
     tierDefaults: Record<ModelTier, TierDefault> = DEFAULT_TIER_DEFAULTS,
     emergencyStopCredits = DEFAULT_EMERGENCY_STOP_CREDITS,
+    private readonly useDefaultLocalKeyFallback = false,
   ) {
     this.providers = providers
       .map((provider) => deepCloneProvider(provider))
@@ -328,9 +340,10 @@ static fromConfig(configPath: string): ProviderRegistry {
     let providers = DEFAULT_PROVIDERS.map((provider) => deepCloneProvider(provider));
     let tierDefaults = DEFAULT_TIER_DEFAULTS;
     let emergencyStopCredits = DEFAULT_EMERGENCY_STOP_CREDITS;
+    let useDefaultLocalKeyFallback = true;
 
     if (!fs.existsSync(configPath)) {
-      return new ProviderRegistry(providers, tierDefaults, emergencyStopCredits);
+      return new ProviderRegistry(providers, tierDefaults, emergencyStopCredits, useDefaultLocalKeyFallback);
     }
 
     try {
@@ -338,6 +351,7 @@ static fromConfig(configPath: string): ProviderRegistry {
       const configuredProviders = normalizeProviders(raw.providers);
       if (configuredProviders.length > 0) {
         providers = configuredProviders;
+        useDefaultLocalKeyFallback = false;
       }
 
       if (raw.tierDefaults && typeof raw.tierDefaults === "object") {
@@ -356,7 +370,7 @@ static fromConfig(configPath: string): ProviderRegistry {
       // Keep defaults if config is invalid.
     }
 
-    return new ProviderRegistry(providers, tierDefaults, emergencyStopCredits);
+    return new ProviderRegistry(providers, tierDefaults, emergencyStopCredits, useDefaultLocalKeyFallback);
   }
 
   resolveModel(tier: ModelTier, survivalMode = false): ResolvedModel {
@@ -505,6 +519,9 @@ static fromConfig(configPath: string): ProviderRegistry {
     }
 
     if (provider.id === "local") {
+      if (this.useDefaultLocalKeyFallback && process.env.LOCAL_API_KEY) {
+        return process.env.LOCAL_API_KEY;
+      }
       return "local";
     }
 

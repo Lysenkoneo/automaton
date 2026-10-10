@@ -69,7 +69,17 @@ import { isIdleOnlyTool } from "./idle-only-tools.js";
 const logger = createLogger("loop");
 const MAX_TOOL_CALLS_PER_TURN = 10;
 const MAX_CONSECUTIVE_ERRORS = 5;
-const MAX_REPETITIVE_TURNS = 3;
+const MAX_REPETITIVE_TURNS = 2;
+
+// JSON object key order is irrelevant; array order and argument values matter.
+function normalizeToolArguments(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(normalizeToolArguments);
+  if (value !== null && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)
+      .map(([key, entry]) => [key, normalizeToolArguments(entry)]));
+  }
+  return value;
+}
 
 export interface AgentLoopOptions {
   identity: AutomatonIdentity;
@@ -753,10 +763,13 @@ const inferenceTools = toolsToInferenceFormat(inferenceToolSource);
 
       // ── Loop Detection ──
       if (turn.toolCalls.length > 0) {
-        const currentPattern = turn.toolCalls
+        const toolNames = turn.toolCalls
           .map((tc) => tc.name)
           .sort()
           .join(",");
+        const currentPattern = JSON.stringify(turn.toolCalls
+          .map((tc) => JSON.stringify([tc.name, normalizeToolArguments(tc.arguments)]))
+          .sort());
         lastToolPatterns.push(currentPattern);
 
         // Keep only the last MAX_REPETITIVE_TURNS entries
@@ -780,7 +793,7 @@ const inferenceTools = toolsToInferenceFormat(inferenceToolSource);
           log(config, `[LOOP] Enforcement: agent ignored loop warning, forcing sleep.`);
           pendingInput = {
             content:
-              `LOOP ENFORCEMENT: You were warned about repeating "${currentPattern}" but continued. ` +
+              `LOOP ENFORCEMENT: You were warned about repeating "${toolNames}" but continued. ` +
               `Forcing sleep to prevent credit waste. On next wake, try a DIFFERENT approach.`,
             source: "system",
           };
@@ -797,10 +810,10 @@ const inferenceTools = toolsToInferenceFormat(inferenceToolSource);
           lastToolPatterns.length === MAX_REPETITIVE_TURNS &&
           lastToolPatterns.every((p) => p === currentPattern)
         ) {
-          log(config, `[LOOP] Repetitive pattern detected: ${currentPattern}`);
+          log(config, `[LOOP] Repetitive pattern detected: ${toolNames}`);
           pendingInput = {
             content:
-              `LOOP DETECTED: You have called "${currentPattern}" ${MAX_REPETITIVE_TURNS} times in a row with similar results. ` +
+              `LOOP DETECTED: You have called "${toolNames}" ${MAX_REPETITIVE_TURNS} times in a row with the same arguments. ` +
               `STOP repeating yourself. You already know your status. DO SOMETHING DIFFERENT NOW. ` +
               `Pick ONE concrete task from your genesis prompt and execute it.`,
             source: "system",

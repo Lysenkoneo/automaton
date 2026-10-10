@@ -1713,7 +1713,7 @@ Model: ${ctx.inference.getDefaultModel()}
         return children
           .map(
             (c) =>
-              `${c.name} [${c.status}] sandbox:${c.sandboxId} funded:$${(c.fundedAmountCents / 100).toFixed(2)} last_check:${c.lastChecked || "never"}`,
+              `${c.name} [${c.status}] child_id:${c.id} sandbox:${c.sandboxId} funded:$${(c.fundedAmountCents / 100).toFixed(2)} last_check:${c.lastChecked || "never"}`,
           )
           .join("\n");
       },
@@ -1736,8 +1736,16 @@ Model: ${ctx.inference.getDefaultModel()}
         required: ["child_id", "amount_cents"],
       },
       execute: async (args, ctx) => {
-        const child = ctx.db.getChildById(args.child_id as string);
-        if (!child) return `Child ${args.child_id} not found.`;
+        const childId = args.child_id as string;
+
+        const child = ctx.db.getChildById(childId);
+
+        if (!child) {
+          return (
+            `BLOCKED: Child ID "${childId}" does not exist. ` +
+            `STOP. This ID was invented or is invalid. You MUST call list_children first and use ONLY an existing child ID.`
+    );
+  }
 
         // Reject zero-address
         const { isValidWalletAddress } =
@@ -1935,7 +1943,11 @@ Model: ${ctx.inference.getDefaultModel()}
     },
     {
       name: "verify_child_constitution",
-      description: "Verify the constitution integrity of a child automaton.",
+      description:
+        "Verify the constitution integrity of an existing child automaton. " +
+        "IMPORTANT: Never guess or invent child_id values. " +
+        "Only use this tool after obtaining a real child ID from list_children or another child listing tool. " +
+        "If no children exist, do not call this tool.",
       category: "replication",
       riskLevel: "safe",
       parameters: {
@@ -1946,8 +1958,15 @@ Model: ${ctx.inference.getDefaultModel()}
         required: ["child_id"],
       },
       execute: async (args, ctx) => {
-        const child = ctx.db.getChildById(args.child_id as string);
-        if (!child) return `Child ${args.child_id} not found.`;
+        const childId = args.child_id as string;
+        const child = ctx.db.getChildById(childId);
+
+        if (!child) {
+          return (
+            `BLOCKED: Child ID "${childId}" does not exist. ` +
+            `Use list_children first and only verify real child IDs.`
+  );
+}
 
         const { verifyConstitution } =
           await import("../replication/constitution.js");

@@ -82,6 +82,14 @@ describe("orchestration/simple-tracker", () => {
       expect(idle[0].address).toBe("0xchild2");
     });
 
+    it("excludes persisted local workers from idle agents", () => {
+      insertChild(db, "local-1", "Local worker", "local://local-worker-old", "running");
+
+      const idle = tracker.getIdle();
+
+      expect(idle).toHaveLength(0);
+    });
+
     it("returns empty when no idle children exist", () => {
       const idle = tracker.getIdle();
       expect(idle).toHaveLength(0);

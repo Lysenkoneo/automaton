@@ -555,9 +555,19 @@ export class Orchestrator {
     await this.collectResults();
 
     for (const event of this.pendingTaskResults) {
+      const pendingTask = getTaskById(this.params.db, event.taskId);
+      // Pause preserves an outstanding attempt and its valid result for resume.
+      // Stale results and duplicates of terminal tasks still get dequeued below.
+      if (pendingTask && getGoalById(this.params.db, pendingTask.goalId)?.status === "paused" &&
+          ["assigned", "running"].includes(pendingTask.status) &&
+          pendingTask.assignedTo === event.workerAddress && event.attemptId &&
+          pendingTask.attemptId === event.attemptId) {
+        continue;
+      }
       const apply = (): "completed" | "failure" | "ignored" => {
         const task = getTaskById(this.params.db, event.taskId);
-        if (!task || task.assignedTo !== event.workerAddress || !event.attemptId ||
+        if (!task || getGoalById(this.params.db, task.goalId)?.status !== "active" ||
+            task.assignedTo !== event.workerAddress || !event.attemptId ||
             task.attemptId !== event.attemptId || !["assigned", "running"].includes(task.status)) return "ignored";
         const attempt: TaskAttempt = { taskId: task.id, workerAddress: event.workerAddress, attemptId: event.attemptId };
         if (event.result.success) {
@@ -586,6 +596,20 @@ export class Orchestrator {
         retryNextTick.add(event.taskId);
         if (getTaskById(this.params.db, event.taskId)?.status === "failed") counters.tasksFailed += 1;
       }
+    }
+
+    if (goal.status !== "active") {
+      logger.info("Releasing orchestrator state for a goal that is no longer active", {
+        goalId: goal.id,
+        status: goal.status,
+      });
+      return {
+        ...state,
+        phase: "idle",
+        goalId: null,
+        failedTaskId: null,
+        failedError: null,
+      };
     }
 
     // Recover stale tasks: workers that died (process restart, sandbox crash)
@@ -693,7 +717,15 @@ export class Orchestrator {
 
     const progress = getGoalProgress(this.params.db, goal.id);
 
-    if (progress.total > 0 && progress.completed === progress.total) {
+    if (progress.total === 0) {
+      logger.info("Active goal has no tasks; returning to classification", { goalId: goal.id });
+      return {
+        ...state,
+        phase: "classifying",
+      };
+    }
+
+    if (progress.completed === progress.total) {
       updateGoalStatus(this.params.db, goal.id, "completed");
       return {
         ...state,
@@ -909,7 +941,9 @@ export class Orchestrator {
        ORDER BY created_at ASC`,
     ).all() as { name: string; address: string; status: string }[];
 
-    const candidate = rows.find((row) => !idleAddresses.has(row.address));
+    const candidate = rows.find(
+      (row) => !row.address.startsWith("local://") && !idleAddresses.has(row.address),
+    );
     if (!candidate) {
       return null;
     }

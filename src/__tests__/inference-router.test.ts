@@ -224,6 +224,15 @@ describe("InferenceRouter", () => {
   });
 
   describe("selectModel", () => {
+    it.each(["normal", "high", "critical", "dead"] as const)("limits Ollama preference to critical/dead at %s", (tier) => {
+      const local = { ...registry.get("gpt-5-mini")!, modelId: "qwen2.5:7b", provider: "ollama" as const,
+        tierMinimum: "critical" as const, costPer1kInput: 0, costPer1kOutput: 0, enabled: true };
+      registry.upsert(local);
+      const expected = tier === "critical" || tier === "dead"
+        ? local.modelId : DEFAULT_ROUTING_MATRIX[tier].agent_turn.candidates[0];
+      expect(router.selectModel(tier, "agent_turn")?.modelId).toBe(expected);
+    });
+
     it("returns correct model for normal/agent_turn", () => {
       const model = router.selectModel("normal", "agent_turn");
       expect(model).not.toBeNull();

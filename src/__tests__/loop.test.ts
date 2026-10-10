@@ -490,6 +490,55 @@ describe("Agent Loop", () => {
     expect(db.getAgentState()).not.toBe("dead");
   });
 
+  it("does not treat different arguments to the same tool as repetitions", async () => {
+    const inference = new MockInferenceClient([
+      ...["echo one", "echo two", "echo three", "echo four"].map((command) =>
+        toolCallResponse([{ name: "exec", arguments: { command } }])),
+      noToolResponse("Done."),
+    ]);
+    const turns: AgentTurn[] = [];
+    await runAgentLoop({ identity, config, db, conway, inference, onTurnComplete: turn => turns.push(turn) });
+    expect(conway.execCalls.map(call => call.command)).toEqual(["echo one", "echo two", "echo three", "echo four"]);
+    expect(turns).toHaveLength(5);
+    expect(turns.some(turn => turn.input?.includes("LOOP DETECTED"))).toBe(false);
+  });
+
+  it("normalizes object key order and forces sleep after four identical calls", async () => {
+    const responses = Array.from({ length: 6 }, (_, i) => toolCallResponse([{ name: "exec", arguments: i % 2
+      ? { timeout: 1000, command: "echo same", metadata: { b: 2, a: 1 } }
+      : { command: "echo same", metadata: { a: 1, b: 2 }, timeout: 1000 } }]));
+    const inference = new MockInferenceClient(responses);
+    const turns: AgentTurn[] = [];
+    await runAgentLoop({ identity, config, db, conway, inference, onTurnComplete: turn => turns.push(turn) });
+    expect(turns[2].input).toContain("LOOP DETECTED");
+    expect(conway.execCalls).toHaveLength(4);
+    expect(db.getAgentState()).toBe("sleeping");
+  });
+
+  it("resets the loop warning when arguments change without changing the tool", async () => {
+    const inference = new MockInferenceClient([
+      ...["echo same", "echo same", "echo changed", "echo another"].map(command =>
+        toolCallResponse([{ name: "exec", arguments: { command } }])),
+      noToolResponse("Done."),
+    ]);
+    const turns: AgentTurn[] = [];
+    await runAgentLoop({ identity, config, db, conway, inference, onTurnComplete: turn => turns.push(turn) });
+    expect(turns[2].input).toContain("LOOP DETECTED");
+    expect(turns).toHaveLength(5);
+    expect(conway.execCalls).toHaveLength(4);
+  });
+
+  it("still detects maintenance after two different idle-only tool turns", async () => {
+    const inference = new MockInferenceClient([
+      toolCallResponse([{ name: "check_credits", arguments: {} }]),
+      toolCallResponse([{ name: "system_synopsis", arguments: {} }]),
+      noToolResponse("Done."),
+    ]);
+    const turns: AgentTurn[] = [];
+    await runAgentLoop({ identity, config, db, conway, inference, onTurnComplete: turn => turns.push(turn) });
+    expect(turns[2].input).toContain("MAINTENANCE LOOP DETECTED");
+  });
+
   it("maintenance loop detected after 3 consecutive idle-only turns", async () => {
     // Simulate: wakeup turn with check_credits, then 2 more idle-only turns,
     // triggering maintenance loop detection on the 3rd idle-only turn.
@@ -844,7 +893,8 @@ describe("Agent Loop", () => {
     const loopWarning = turns.find(
       (t) => t.input?.includes("LOOP DETECTED"),
     );
-    expect(loopWarning).toBeDefined();
+    // Different file paths are productive calls, not repeated arguments.
+    expect(loopWarning).toBeUndefined();
   });
 
   it("sleeps early when delegated work is active and no self-assigned parent task remains", async () => {
