@@ -1,3 +1,4 @@
+import { assertLocalOllamaUrl } from "./local-mode.js";
 import fs from "node:fs";
 import OpenAI from "openai";
 
@@ -252,6 +253,7 @@ const DEFAULT_PROVIDERS: ProviderConfig[] = [
 ];
 
 export class ProviderRegistry {
+  private localOnly = false;
   private readonly providers: ProviderConfig[];
   private readonly tierDefaults: Record<ModelTier, TierDefault>;
   private readonly disablements = new Map<string, ProviderDisablement>();
@@ -275,15 +277,21 @@ export class ProviderRegistry {
   }
 
   overrideBaseUrl(providerId: string, baseUrl: string): void {
+    if (this.localOnly && providerId === "local") assertLocalOllamaUrl(baseUrl.replace(/\/v1\/?$/, ""));
     const provider = this.providers.find((p) => p.id === providerId);
     if (provider) {
       provider.baseUrl = baseUrl;
     }
   }
 
-  configureLocalOllama(modelId: string, baseUrl: string): void {
+  configureLocalOllama(modelId: string, baseUrl: string, localOnly = false): void {
+    if (localOnly) assertLocalOllamaUrl(baseUrl);
+    this.localOnly = localOnly;
     const local = this.providers.find((provider) => provider.id === "local");
-    if (!local) return;
+    if (!local) {
+      if (localOnly) throw new Error("Strict local Ollama provider is missing");
+      return;
+    }
 
     local.enabled = true;
     local.baseUrl = `${baseUrl.replace(/\/$/, "")}/v1`;
@@ -424,6 +432,7 @@ static fromConfig(configPath: string): ProviderRegistry {
   }
 
   getModel(providerId: string, modelId: string): ResolvedModel {
+    if (this.localOnly && providerId !== "local") throw new Error("External inference is forbidden in strict local mode");
     const provider = this.providers.find((candidate) => candidate.id === providerId);
     if (!provider) {
       throw new Error(`Unknown provider '${providerId}'`);
@@ -440,6 +449,8 @@ static fromConfig(configPath: string): ProviderRegistry {
 
     return this.buildResolvedModel(provider, model);
   }
+
+  isLocalOnly(): boolean { return this.localOnly; }
 
   getProviders(): ProviderConfig[] {
     return this.providers
@@ -468,6 +479,7 @@ static fromConfig(configPath: string): ProviderRegistry {
   }
 
   private getProviderOrderForTier(tier: ModelTier): ProviderConfig[] {
+    if (this.localOnly) return this.providers.filter(provider => provider.id === "local");
     const preferred = this.tierDefaults[tier];
     const orderedIds = [
       preferred.preferredProvider,
@@ -503,6 +515,7 @@ static fromConfig(configPath: string): ProviderRegistry {
     const client = new OpenAI({
       apiKey,
       baseURL: provider.baseUrl,
+      ...(this.localOnly ? { fetch: (url: RequestInfo | URL, init?: RequestInit) => globalThis.fetch(url, { ...init, redirect: "error" }) } : {}),
     });
 
     return {
@@ -563,6 +576,7 @@ static fromConfig(configPath: string): ProviderRegistry {
   }
 
   private assertEmergencyPolicy(): void {
+    if (this.localOnly) return;
     const rawCredits = process.env.AUTOMATON_CREDITS_BALANCE;
     if (!rawCredits) {
       return;

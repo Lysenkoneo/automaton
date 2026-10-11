@@ -3,6 +3,7 @@ import {
   ProviderRegistry,
   type ProviderConfig,
 } from "../../inference/provider-registry.js";
+import { createWorkerInferenceBridge } from "../../agent/worker-inference-bridge.js";
 import { UnifiedInferenceClient } from "../../inference/inference-client.js";
 import type { ChatMessage } from "../../types.js";
 
@@ -110,6 +111,34 @@ describe("UnifiedInferenceClient", () => {
   afterAll(() => {
     process.env = { ...ORIGINAL_ENV };
     vi.useRealTimers();
+  });
+
+
+  it.each(["reasoning", "fast", "cheap"] as const)("strict planner/worker bridge uses Qwen for %s", async tier => {
+    const registry = createDefaultRegistry();
+    registry.configureLocalOllama("qwen2.5:7b", "http://localhost:11434", true);
+    const bridge = createWorkerInferenceBridge(createClient(registry));
+    queueCompletion();
+    await bridge.chat({ tier, messages: BASE_MESSAGES });
+    expect(mockState.calls).toHaveLength(1);
+    expect(mockState.calls[0].model).toBe("qwen2.5:7b");
+    expect(mockState.ctor.mock.calls[0][0].baseURL).toBe("http://localhost:11434/v1");
+  });
+
+  it("strict worker exhausts Ollama retries without calling a second provider", async () => {
+    const registry = createDefaultRegistry();
+    registry.configureLocalOllama("qwen2.5:7b", "http://localhost:11434", true);
+    const client = createClient(registry);
+    for (let i = 0; i < 4; i++) queueError(503, "Ollama unavailable");
+    vi.useFakeTimers();
+    try {
+      const assertion = expect(client.chat({ tier: "fast", messages: BASE_MESSAGES })).rejects.toThrow(/Strict local Ollama.*Ollama unavailable/);
+      await vi.runAllTimersAsync();
+      await assertion;
+      expect(mockState.calls).toHaveLength(4);
+      expect(mockState.ctor).toHaveBeenCalledTimes(1);
+      expect(mockState.calls.every(call => call.model === "qwen2.5:7b")).toBe(true);
+    } finally { vi.useRealTimers(); }
   });
 
   it("chat resolves tier and returns result", async () => {

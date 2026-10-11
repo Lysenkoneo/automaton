@@ -22,14 +22,13 @@ import { createLogger } from "../observability/logger.js";
 import { getMetrics } from "../observability/metrics.js";
 import { AlertEngine, createDefaultAlertRules } from "../observability/alerts.js";
 import { metricsInsertSnapshot, metricsPruneOld } from "../state/database.js";
+import { isLocalInference } from "../inference/local-mode.js";
 import { ulid } from "ulid";
 
 const logger = createLogger("heartbeat.tasks");
 
 function isLocalOllama(config: HeartbeatLegacyContext["config"]): boolean {
-  const url = config.ollamaBaseUrl;
-  return !!url &&
-    /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(?::\d+)?(?:\/|$)/i.test(url);
+  return isLocalInference(config);
 }
 
 // Module-level AlertEngine so cooldown state persists across ticks.

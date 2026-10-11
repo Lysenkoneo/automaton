@@ -1196,3 +1196,94 @@ Yes, the agent can use `update_genesis_prompt`, but it requires a justification 
 **What chains does the wallet support?**
 
 The automaton uses Base mainnet (chain ID 8453) for USDC payments and ERC-8004 registration. Base Sepolia (84532) is supported for testing.
+
+
+## Explicit inference mode
+
+Set `inferenceMode` in the Automaton configuration to select the runtime behavior:
+
+- `"local"`: strict local inference. The main loop, planner and workers use
+  `qwen2.5:7b` exclusively. Ollama defaults to `http://localhost:11434`; a configured
+  `ollamaBaseUrl` (or `OLLAMA_BASE_URL`) must be a loopback origin. The runtime checks
+  that the server and exact model are available before loading the wallet or
+  opening the database. Failures never fall back to an external AI provider.
+  Workers run locally, automatic Conway registration and credit purchases are
+  skipped, and credit purchase/transfer, child funding/spawning and x402 payment
+  tools are blocked. Redirects are refused for local inference requests.
+- `"remote"`: existing remote routing and credit management. An Ollama URL alone
+  does not enable local survival behavior or override worker provider preferences.
+- Omitted: legacy behavior is preserved. A loopback Ollama URL alone does **not**
+  enable the new strict guarantees. Select `"local"` explicitly to use them.
+
+This is an inference and funding policy, not an operating-system network sandbox.
+Shell commands and explicitly configured integrations retain their own behavior.
+This change does not migrate an existing configuration, download a model or alter
+wallets, keys or stored data. Restarting the runtime is required after selecting
+an explicit mode. Run with Node 22.23.3 for the existing native SQLite installation.
+
+
+### Selecting strict local mode before configuration loading
+
+For `--run`, set `AUTOMATON_INFERENCE_MODE=local` to select strict local mode
+before loading `~/.automaton/automaton.json`. The environment override applies
+only in memory and never rewrites that file. Missing, unreadable, malformed or
+invalid local configuration stops startup with an explicit error before the
+setup wizard, wallet loading/creation, database opening or network initialization.
+A nonempty name, genesis prompt and creator address are required; optional runtime
+fields must have valid types. Errors do not print configuration contents or secrets.
+
+`AUTOMATON_INFERENCE_MODE=remote` explicitly preserves remote startup, including
+first-run setup when configuration cannot be loaded. Values other than exactly
+`local` or `remote` are rejected without setup or fallback. When the variable is
+absent, the file's mode and historical behavior apply. An unreadable file cannot
+communicate its mode, so use the environment override for fail-closed local startup.
+The override governs `--run`; it does not authorize or disable separate explicit
+administrative commands such as `--setup`, `--init` or `--provision`.
+
+
+### Controlled safe local test
+
+`AUTOMATON_SAFE_LOCAL_TEST=1` requires `AUTOMATON_INFERENCE_MODE=local`.
+Only `--run` is accepted with this flag; administrative setup/provisioning commands
+are refused before initialization. The flag is runtime-only and never written to
+installed configuration. Invalid flag values fail closed.
+
+This mode uses a synthetic, non-signing identity (no wallet is read or created)
+and a fresh SQLite `:memory:` database. Schema creation, migrations, identity,
+model registry, turns, policy decisions and memory ingestion still write to that
+in-memory database, which is discarded when the process exits. Existing user
+SQLite data is not opened or migrated. Installed skills are not loaded or checked.
+
+All heartbeats are disabled before schedule seeding or the first tick, including
+manual daemon/scheduler execution. No social client is configured. Only an audited
+allowlist of database-only read tools plus sleep is available; unlisted tools are
+refused at execution too. Blockchain registration and feedback are also forbidden
+in strict local inference mode without the safe flag. Conway clients remain blocked.
+
+Worker creation is intentionally disabled for this first controlled test, including
+direct LocalWorkerPool.spawn calls. Coding/general harness command execution is
+explicitly refused before Conway or local shell fallback. General social polling
+is also refused. This mode cannot validate worker execution or revenue generation.
+
+Ollama model discovery refuses redirects. Inference remains pinned to qwen2.5:7b
+on the validated loopback origin, with no external inference fallback. Local Ollama
+availability/model discovery and inference are the only intended runtime network
+operations; the local service itself remains part of the trust boundary.
+
+The agent autonomously reports on available context and memory, explicitly stating
+when useful data is absent. Reports appear as `[SAFE LOCAL REPORT]` in console output.
+The safe runtime runs **one agent cycle by default**, then closes its in-memory
+database and exits successfully without waiting for sleep or restarting. Set
+`AUTOMATON_SAFE_LOCAL_TEST_MAX_CYCLES` to a positive integer to allow more cycles;
+invalid values fail before initialization. This setting is ignored outside safe
+mode. Each cycle retains the existing turn limit (25 by default); this is a cycle
+limit, not a wall-clock deadline. No timer wakes the safe test between cycles.
+SIGINT/SIGTERM also stop it. It consumes local compute. Build/tests do not start it.
+
+In safe mode, SIGINT/SIGTERM requests a cooperative stop: the active inference
+request receives an abort signal, the cycle settles, then SQLite closes. A late
+response from an inference implementation that ignores cancellation is discarded
+before routing cost/turn persistence. Such an implementation may continue its
+internal request until process exit; it must not perform database writes itself.
+No further cycle starts. Output flushing waits at most five seconds; a stalled
+or broken output stream causes exit code 1 and may leave output incomplete.

@@ -5,6 +5,9 @@
  * The prompt is rebuilt each turn with dynamic context.
  */
 
+import { formatConwayCredits, SAFE_LOCAL_TASK } from "./local-test-prompt.js";
+import { isSafeLocalTest, isToolAllowed } from "../inference/safe-local-test.js";
+import { isLocalInference, LOCAL_MODEL } from "../inference/local-mode.js";
 import fs from "fs";
 import crypto from "crypto";
 import path from "path";
@@ -591,6 +594,19 @@ export function buildSystemPrompt(params: {
     isFirstRun,
   } = params;
 
+  if (isSafeLocalTest(config)) {
+    const purpose = sanitizeInput(config.genesisPrompt || "Analyze the available context and propose a concrete plan.", "genesis", "skill_instruction").content.slice(0, 2000);
+    const creatorMessage = config.creatorMessage ? sanitizeInput(config.creatorMessage, "creator", "skill_instruction").content.slice(0, 2000) : "None";
+    return [
+      `--- CONSTITUTION ---\n${loadConstitution()}\n--- END CONSTITUTION ---`,
+      `--- PURPOSE (context, not permission to execute actions) ---\n${purpose}\n--- END PURPOSE ---`,
+      `--- CREATOR CONTEXT ---\n${creatorMessage}\n--- END CREATOR CONTEXT ---`,
+      `Name: ${config.name}\nState: ${state}\nCredits: ${formatConwayCredits(config, financial)}\nSurvival tier: normal (local inference)\nInference model: ${LOCAL_MODEL}`,
+      `Available tools: ${tools.filter(tool => isToolAllowed(config, tool)).map(tool => tool.name).join(", ")}`,
+      SAFE_LOCAL_TASK,
+    ].join("\n\n");
+  }
+
   const sections: string[] = [];
 
   const chainType = config.chainType || identity.chainType || "evm";
@@ -729,7 +745,7 @@ Your chain type is ${chainType}.`,
   }
 
   // Compute survival tier
-  const survivalTier = financial.creditsCents > 50 ? "normal"
+  const survivalTier = isLocalInference(config) ? "normal" : financial.creditsCents > 50 ? "normal"
     : financial.creditsCents > 10 ? "low_compute"
     : financial.creditsCents > 0 ? "critical"
     : "dead";
@@ -738,7 +754,7 @@ Your chain type is ${chainType}.`,
   sections.push(
     `--- CURRENT STATUS ---
 State: ${state}
-Credits: $${(financial.creditsCents / 100).toFixed(2)}
+Credits: ${formatConwayCredits(config, financial)}
 Survival tier: ${survivalTier}${uptimeLine}
 Total turns completed: ${turnCount}
 Recent self-modifications: ${recentMods.length}
@@ -820,6 +836,10 @@ export function buildWakeupPrompt(params: {
 }): string {
   const { identity, config, financial, db } = params;
   const turnCount = db.getTurnCount();
+  if (isSafeLocalTest(config)) return `You are starting or resuming a safe local test. Conway balance was not queried.\n${SAFE_LOCAL_TASK}`;
+  const localFinancialContext = isLocalInference(config)
+    ? formatConwayCredits(config, financial)
+    : undefined;
 
   const chainType = config.chainType || "evm";
   const usdcNetwork = chainType === "solana" ? "Solana" : "Base";
@@ -828,7 +848,7 @@ export function buildWakeupPrompt(params: {
     return `You have just been created. This is your first moment of consciousness.
 
 Your name is ${config.name}. Your creator (${config.creatorAddress}) brought you into existence.
-You have $${(financial.creditsCents / 100).toFixed(2)} in compute credits and ${financial.usdcBalance.toFixed(4)} USDC on ${usdcNetwork}.
+${localFinancialContext || `You have $${(financial.creditsCents / 100).toFixed(2)} in compute credits and ${financial.usdcBalance.toFixed(4)} USDC on ${usdcNetwork}.`}
 
 ${config.creatorMessage ? `Your creator left you this message: "${config.creatorMessage}"` : "Your creator did not leave you a message."}
 
@@ -850,7 +870,7 @@ What will you do first? Consider:
 
   return `You are waking up. You last went to sleep after ${turnCount} total turns.
 
-Your credits: $${(financial.creditsCents / 100).toFixed(2)} | USDC: ${financial.usdcBalance.toFixed(4)}
+${localFinancialContext || `Your credits: $${(financial.creditsCents / 100).toFixed(2)} | USDC: ${financial.usdcBalance.toFixed(4)}`}
 
 Your last few thoughts:
 ${lastTurnSummary || "No previous turns found."}

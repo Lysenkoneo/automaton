@@ -4,6 +4,7 @@
  * Loads and saves the automaton's configuration from ~/.automaton/automaton.json
  */
 
+import { assertSafeLocalEnvironment } from "./inference/safe-local-test.js";
 import fs from "fs";
 import path from "path";
 import type { AutomatonConfig, TreasuryPolicy, ModelStrategyConfig, SoulConfig } from "./types.js";
@@ -24,14 +25,20 @@ export function getConfigPath(): string {
  * Load the automaton config from disk.
  * Merges with defaults for any missing fields.
  */
-export function loadConfig(): AutomatonConfig | null {
+export function loadConfig(options: { inferenceMode?: "local" | "remote" } = {}): AutomatonConfig | null {
+  let strictLocal = options.inferenceMode === "local";
   const configPath = getConfigPath();
-  if (!fs.existsSync(configPath)) {
-    return null;
-  }
-
   try {
+    if (!fs.existsSync(configPath)) {
+      if (strictLocal) throw new Error("Configuration file is missing");
+      return null;
+    }
     const raw = JSON.parse(fs.readFileSync(configPath, "utf-8"));
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+      throw new Error("Configuration must be a JSON object");
+    }
+    strictLocal = (options.inferenceMode ?? raw.inferenceMode) === "local";
+    if (strictLocal) validateLocalConfig(raw);
     const apiKey = raw.conwayApiKey || loadApiKeyFromConfig();
 
     // Deep-merge treasury policy with defaults
@@ -64,6 +71,7 @@ export function loadConfig(): AutomatonConfig | null {
     return {
       ...DEFAULT_CONFIG,
       ...raw,
+      ...(options.inferenceMode ? { inferenceMode: options.inferenceMode } : {}),
       sandboxId:
         typeof raw.sandboxId === "string"
           ? raw.sandboxId.trim()
@@ -75,8 +83,68 @@ export function loadConfig(): AutomatonConfig | null {
       chainType: raw.chainType || "evm",
     } as AutomatonConfig;
   } catch {
+    if (strictLocal) {
+      // Never include file contents, parser excerpts, or credential values.
+      throw new Error("Strict local startup refused: configuration is missing, unreadable or invalid; setup wizard is disabled");
+    }
     return null;
   }
+}
+
+/** Minimum shape and runtime field types needed for safe local initialization. */
+function validateLocalConfig(raw: Record<string, unknown>): void {
+  for (const field of ["name", "genesisPrompt", "creatorAddress"]) {
+    if (typeof raw[field] !== "string" || !(raw[field] as string).trim()) throw new Error("Invalid required field");
+  }
+  for (const field of ["dbPath", "heartbeatConfigPath", "skillsDir", "ollamaBaseUrl", "inferenceModel", "conwayApiUrl", "creatorAddress", "walletAddress", "chainType", "logLevel"]) {
+    if (raw[field] !== undefined && (typeof raw[field] !== "string" || !(raw[field] as string).trim())) throw new Error("Invalid configuration field");
+  }
+  for (const field of ["maxTokensPerTurn", "maxTurnsPerCycle", "maxChildren", "childSandboxMemoryMb"]) {
+    const value = raw[field];
+    if (value !== undefined && (typeof value !== "number" || !Number.isInteger(value) || value < (field === "maxChildren" ? 0 : 1))) throw new Error("Invalid numeric configuration field");
+  }
+  for (const field of ["modelStrategy", "treasuryPolicy", "soulConfig"]) {
+    const value = raw[field];
+    if (value !== undefined && (!value || typeof value !== "object" || Array.isArray(value))) throw new Error("Invalid configuration section");
+  }
+  for (const field of ["conwayApiKey", "openaiApiKey", "anthropicApiKey", "sandboxId", "creatorMessage", "parentAddress", "socialRelayUrl", "rpcUrl"]) {
+    // This validator runs only in strict local mode, where Conway credentials are optional.
+    if (field === "conwayApiKey" && raw[field] === null) continue;
+    if (raw[field] !== undefined && typeof raw[field] !== "string") throw new Error("Invalid configuration field");
+  }
+  if (raw.registeredWithConway !== undefined && typeof raw.registeredWithConway !== "boolean") throw new Error("Invalid registration flag");
+  if (raw.inferenceMode !== undefined && raw.inferenceMode !== "local" && raw.inferenceMode !== "remote") throw new Error("Invalid inference mode");
+  for (const [section, defaults] of [["modelStrategy", DEFAULT_MODEL_STRATEGY_CONFIG], ["treasuryPolicy", DEFAULT_TREASURY_POLICY], ["soulConfig", DEFAULT_SOUL_CONFIG]] as const) {
+    const values = raw[section] as Record<string, unknown> | undefined;
+    if (!values) continue;
+    const knownDefaults = new Map<string, unknown>(Object.entries(defaults));
+    for (const [key, value] of Object.entries(values)) {
+      const expected = knownDefaults.get(key);
+      if (expected === undefined) continue;
+      if (Array.isArray(expected)) {
+        if (!Array.isArray(value) || value.some(item => typeof item !== "string")) throw new Error("Invalid configuration list");
+      } else if (typeof value !== typeof expected || (typeof value === "number" && (!Number.isFinite(value) || value < 0))) {
+        throw new Error("Invalid configuration section value");
+      }
+    }
+  }
+  if (raw.chainType !== undefined && raw.chainType !== "evm" && raw.chainType !== "solana") throw new Error("Invalid chain type");
+  if (raw.logLevel !== undefined && !["debug", "info", "warn", "error"].includes(raw.logLevel as string)) throw new Error("Invalid log level");
+}
+
+/** Resolve an explicit mode before any first-run setup, without changing installed config. */
+export async function loadStartupConfig(requestedMode: string | undefined = process.env.AUTOMATON_INFERENCE_MODE): Promise<AutomatonConfig> {
+  const safeLocalTest = assertSafeLocalEnvironment(requestedMode);
+  if (requestedMode !== undefined && requestedMode !== "local" && requestedMode !== "remote") {
+    throw new Error("Invalid AUTOMATON_INFERENCE_MODE: expected local or remote");
+  }
+  const inferenceMode = requestedMode as "local" | "remote" | undefined;
+  const config = loadConfig({ inferenceMode });
+  if (config) return { ...config, safeLocalTest };
+  // loadConfig throws instead of returning null when local is explicitly requested.
+  const { runSetupWizard } = await import("./setup/wizard.js");
+  const created = await runSetupWizard();
+  return inferenceMode ? { ...created, inferenceMode } : created;
 }
 
 /**

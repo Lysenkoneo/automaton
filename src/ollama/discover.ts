@@ -43,7 +43,7 @@ export async function discoverOllamaModels(
 
   let data: OllamaTagsResponse;
   try {
-    const resp = await fetch(url, { signal: AbortSignal.timeout(5_000) });
+    const resp = await fetch(url, { signal: AbortSignal.timeout(5_000), redirect: "error" });
     if (!resp.ok) {
       logger.warn(`Ollama /api/tags returned ${resp.status} — skipping discovery`);
       return [];

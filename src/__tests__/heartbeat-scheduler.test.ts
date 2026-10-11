@@ -8,6 +8,13 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { DurableScheduler } from "../heartbeat/scheduler.js";
 import { BUILTIN_TASKS } from "../heartbeat/tasks.js";
 import { bootstrapTopup } from "../conway/topup.js";
+import { getUsdcBalance } from "../conway/x402.js";
+
+// Keep balance checks deterministic and prevent real blockchain RPC calls.
+vi.mock("../conway/x402.js", async (importOriginal) => ({
+  ...await importOriginal<typeof import("../conway/x402.js")>(),
+  getUsdcBalance: vi.fn().mockResolvedValue(5),
+}));
 
 vi.mock("../conway/topup.js", () => ({ bootstrapTopup: vi.fn().mockResolvedValue({ success: false }) }));
 
@@ -99,10 +106,50 @@ describe("DurableScheduler", () => {
     db = createTestDb();
     rawDb = db.raw;
     conway = new MockConwayClient();
+    vi.clearAllMocks();
   });
 
   afterEach(() => {
     db.close();
+  });
+
+  describe("explicit inference mode through tick", () => {
+    it.each([
+      ["local", undefined],
+      ["local", "http://localhost:11434"],
+      ["remote", undefined],
+      ["remote", "http://localhost:11434"],
+    ] as const)("preserves %s mode with Ollama URL %s", async (mode, url) => {
+      const legacy = createLegacyContext(db, conway);
+      legacy.config.inferenceMode = mode;
+      legacy.config.ollamaBaseUrl = url;
+      conway.creditsCents = 5000;
+      const credits = vi.spyOn(conway, "getCreditsBalance");
+      const task = vi.fn<HeartbeatTaskFn>().mockResolvedValue({ shouldWake: false });
+      seedScheduleRow(rawDb, "observe_context");
+      const scheduler = new DurableScheduler(rawDb, DEFAULT_HB_CONFIG,
+        new Map([["observe_context", task]]), legacy);
+
+      // No agent or Qwen call: this is the startup heartbeat path itself.
+      await scheduler.tick();
+
+      expect(task).toHaveBeenCalledTimes(1);
+      const context = task.mock.calls[0][0];
+      if (mode === "local") {
+        expect(credits).not.toHaveBeenCalled();
+        expect(getUsdcBalance).not.toHaveBeenCalled();
+        expect(context.creditBalance).toBe(-1);
+        expect(context.usdcBalance).toBe(0);
+        expect(context.survivalTier).toBe("normal");
+      } else {
+        expect(credits).toHaveBeenCalledTimes(1);
+        expect(getUsdcBalance).toHaveBeenCalledTimes(1);
+        expect(getUsdcBalance).toHaveBeenCalledWith(legacy.identity.address, "eip155:8453", legacy.identity.chainType);
+        expect(context.creditBalance).toBe(5000);
+        expect(context.usdcBalance).toBe(5);
+        expect(context.survivalTier).toBe("high");
+      }
+    });
   });
 
   describe("tick overlap prevention", () => {
@@ -360,6 +407,20 @@ describe("DurableScheduler", () => {
   });
 
   describe("TickContext building", () => {
+    it.each(["local", "remote"] as const)("respects explicit %s mode for a Solana wallet", async inferenceMode => {
+      const credits = vi.spyOn(conway, "getCreditsBalance");
+      const context = await buildTickContext(rawDb, conway, DEFAULT_HB_CONFIG,
+        "mock-solana-address", "solana", "http://localhost:11434", inferenceMode);
+      expect(credits).toHaveBeenCalledTimes(inferenceMode === "local" ? 0 : 1);
+      expect(getUsdcBalance).toHaveBeenCalledTimes(inferenceMode === "local" ? 0 : 1);
+      if (inferenceMode === "remote") {
+        expect(getUsdcBalance).toHaveBeenCalledWith("mock-solana-address", "solana:mainnet", "solana");
+        expect(context.usdcBalance).toBe(5);
+      } else {
+        expect(context.usdcBalance).toBe(0);
+      }
+    });
+
     it("fetches balance once and builds context", async () => {
       conway.creditsCents = 5_000;
 

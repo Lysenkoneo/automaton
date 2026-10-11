@@ -5,6 +5,7 @@
  * Each worker executes through a harness chosen by role via HarnessRegistry.
  */
 
+import { isSafeLocalTest } from "../inference/safe-local-test.js";
 import path from "node:path";
 import os from "node:os";
 import { ulid } from "ulid";
@@ -69,6 +70,7 @@ export class LocalWorkerPool {
   }
 
   spawn(task: TaskNode): { address: string; name: string; sandboxId: string; attemptId: string } {
+    if (isSafeLocalTest(this.config.config)) throw new Error("Worker creation is disabled in safe local test mode");
     const attemptId = task.attemptId ?? ulid();
     const workerTask = { ...task, attemptId };
     const workerId = `local-worker-${ulid()}`;

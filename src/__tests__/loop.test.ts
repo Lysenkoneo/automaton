@@ -6,6 +6,7 @@
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { runAgentLoop } from "../agent/loop.js";
+import { runSafeTestCycles } from "../agent/safe-test-runner.js";
 import { Orchestrator } from "../orchestration/orchestrator.js";
 import { LocalWorkerPool } from "../orchestration/local-worker.js";
 import { HarnessRegistry } from "../agent/harness-registry.js";
@@ -31,6 +32,8 @@ vi.mock("../conway/x402.js", async (importOriginal) => ({
   getUsdcBalance: async () => 0,
 }));
 
+vi.mock("../registry/discovery.js", () => ({ discoverAgents: vi.fn().mockResolvedValue([]), searchAgents: vi.fn().mockResolvedValue([]) }));
+
 vi.mock("../ollama/discover.js", () => ({ discoverOllamaModels: vi.fn() }));
 vi.mock("../conway/topup.js", () => ({ bootstrapTopup: vi.fn() }));
 
@@ -45,11 +48,139 @@ describe("Agent Loop", () => {
     conway = new MockConwayClient();
     identity = createTestIdentity();
     config = createTestConfig();
+    const exists = fs.existsSync.bind(fs);
+    vi.spyOn(fs, "existsSync").mockImplementation(file =>
+      String(file).startsWith(path.join(os.homedir(), ".automaton")) ? false : exists(file));
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("Unexpected real network request")));
   });
 
   afterEach(() => {
     vi.restoreAllMocks();
+    vi.unstubAllGlobals();
     db.close();
+  });
+
+
+  it.each([
+    "Report: the supplied purpose is available; a concrete next step is to review its requirements.",
+    "Report: no useful data is available in the context or memory. No evidence-based analysis can be produced.",
+  ])("safe test delivers a textual report and terminates its runtime: %s", async report => {
+    config.inferenceMode = "local";
+    config.safeLocalTest = true;
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({ models: [{ name: "qwen2.5:7b" }] }))));
+    const { discoverOllamaModels } = await import("../ollama/discover.js");
+    const { ModelRegistry } = await import("../inference/registry.js");
+    vi.mocked(discoverOllamaModels).mockImplementationOnce(async (_url, rawDb) => {
+      const registry = new ModelRegistry(rawDb);
+      registry.upsert({ ...registry.get("gpt-5-mini")!, modelId: "qwen2.5:7b", provider: "ollama", costPer1kInput: 0, costPer1kOutput: 0, enabled: true });
+      return ["qwen2.5:7b"];
+    });
+    const inference = new MockInferenceClient([noToolResponse(report)]);
+    const reports: string[] = [];
+    const close = vi.fn();
+    const runCycle = vi.fn(() => runAgentLoop({ identity, config, db, conway, inference, onTurnComplete: turn => { reports.push(turn.thinking); } }));
+    await runSafeTestCycles({ maxCycles: 1, runCycle, close });
+    expect(reports).toContain(report);
+    expect(runCycle).toHaveBeenCalledTimes(1);
+    expect(close).toHaveBeenCalledTimes(1);
+    expect(db.getAgentState()).toBe("sleeping");
+    const prompt = inference.calls[0].messages[0].content;
+    expect(prompt).toContain("available memory");
+    expect(prompt).toContain("no useful data is available");
+    expect(prompt).toContain("Do not invent observations or ask the user to assign you a task");
+  });
+
+  it.each([
+    ["maintenance", "MAINTENANCE LOOP DETECTED", "check_reputation", "check_inference_spending"],
+    ["repetition", "LOOP DETECTED", "check_inference_spending", "check_inference_spending"],
+  ])("safe %s warning requests useful text then sleep without enabling actions", async (_kind, marker, first, second) => {
+    config.inferenceMode = "local";
+    config.safeLocalTest = true;
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({ models: [{ name: "qwen2.5:7b" }] }))));
+    const { discoverOllamaModels } = await import("../ollama/discover.js");
+    const { ModelRegistry } = await import("../inference/registry.js");
+    vi.mocked(discoverOllamaModels).mockImplementationOnce(async (_url, rawDb) => {
+      const registry = new ModelRegistry(rawDb);
+      registry.upsert({ ...registry.get("gpt-5-mini")!, modelId: "qwen2.5:7b", provider: "ollama", costPer1kInput: 0, costPer1kOutput: 0, enabled: true });
+      return ["qwen2.5:7b"];
+    });
+    const inference = new MockInferenceClient([
+      toolCallResponse([{ name: first, arguments: {} }]),
+      toolCallResponse([{ name: second, arguments: {} }]),
+      toolCallResponse([{ name: "sleep", arguments: { duration_seconds: 60, reason: "text plan delivered" } }], "A concrete plan: analyze the supplied context, list assumptions, and report next steps."),
+    ]);
+    const turns: AgentTurn[] = [];
+    const credits = vi.spyOn(conway, "getCreditsBalance");
+    const exec = vi.spyOn(conway, "exec");
+    const transfer = vi.spyOn(conway, "transferCredits");
+    const spawn = vi.spyOn(LocalWorkerPool.prototype, "spawn");
+    await runAgentLoop({ identity, config, db, conway, inference, onTurnComplete: turn => turns.push(turn) });
+    const warning = turns.find(turn => turn.input?.includes(marker));
+    expect(warning).toBeDefined();
+    expect(warning!.input).toContain("textual answer or concrete plan");
+    expect(warning!.input).toContain("sleep");
+    expect(warning!.input).not.toContain("Write code");
+    expect(warning!.input).not.toContain("execute a CONCRETE task");
+    expect(db.getAgentState()).toBe("sleeping");
+    expect(credits).not.toHaveBeenCalled(); expect(exec).not.toHaveBeenCalled(); expect(transfer).not.toHaveBeenCalled(); expect(spawn).not.toHaveBeenCalled();
+    expect(inference.calls[0].messages[0].content).toContain("SAFE LOCAL TEST");
+    expect(inference.calls[0].messages[0].content).not.toContain("$-0.01");
+  });
+
+  it("strict local preflight stops before Conway when Ollama is unavailable", async () => {
+    config.inferenceMode = "local";
+    const fetch = vi.fn().mockRejectedValue(new Error("ECONNREFUSED"));
+    vi.stubGlobal("fetch", fetch);
+    const credits = vi.spyOn(conway, "getCreditsBalance");
+    try {
+      await expect(runAgentLoop({ identity, config, db, conway, inference: new MockInferenceClient() })).rejects.toThrow(/Strict local Ollama.*ECONNREFUSED/);
+      expect(credits).not.toHaveBeenCalled();
+    } finally { vi.unstubAllGlobals(); }
+  });
+
+
+  it("explicit remote keeps credit checks and matrix routing even with an Ollama URL", async () => {
+    config.inferenceMode = "remote";
+    config.ollamaBaseUrl = "http://localhost:11434";
+    const inference = new MockInferenceClient([noToolResponse("Done")]);
+    const chat = vi.spyOn(inference, "chat");
+    const credits = vi.spyOn(conway, "getCreditsBalance");
+    await runAgentLoop({ identity, config, db, conway, inference });
+    expect(credits).toHaveBeenCalled();
+    expect(chat).toHaveBeenCalledWith(expect.any(Array), expect.objectContaining({ model: "gpt-5.2" }));
+  });
+
+  it("strict local loop requests Qwen and excludes funding tools", async () => {
+    config.inferenceMode = "local";
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({ models: [{ name: "qwen2.5:7b" }] }))));
+    const { discoverOllamaModels } = await import("../ollama/discover.js");
+    const { ModelRegistry } = await import("../inference/registry.js");
+    vi.mocked(discoverOllamaModels).mockImplementationOnce(async (_url, rawDb) => {
+      const registry = new ModelRegistry(rawDb);
+      registry.upsert({ ...registry.get("gpt-5-mini")!, modelId: "qwen2.5:7b", provider: "ollama", costPer1kInput: 0, costPer1kOutput: 0, enabled: true });
+      return ["qwen2.5:7b"];
+    });
+    const inference = new MockInferenceClient([noToolResponse("Done")]);
+    const chat = vi.spyOn(inference, "chat");
+    const credits = vi.spyOn(conway, "getCreditsBalance");
+    const exec = vi.spyOn(conway, "exec");
+    const transfer = vi.spyOn(conway, "transferCredits");
+    const spawn = vi.spyOn(LocalWorkerPool.prototype, "spawn").mockReturnValue({ address: "local://test", name: "test", sandboxId: "test" });
+    vi.spyOn(Orchestrator.prototype, "tick").mockImplementation(async function () {
+      const params = (this as any).params;
+      expect(await params.config.spawnAgent({ title: "test" })).toMatchObject({ address: "local://test" });
+      await expect(params.funding.fundChild("remote-child", 100)).rejects.toThrow(/forbidden/);
+      return { phase: "idle", tasksAssigned: 0, tasksCompleted: 0, tasksFailed: 0, goalsActive: 0, agentsActive: 0 };
+    });
+    try {
+      await runAgentLoop({ identity, config, db, conway, inference });
+      expect(chat).toHaveBeenCalledWith(expect.any(Array), expect.objectContaining({ model: "qwen2.5:7b" }));
+      expect(chat.mock.calls[0][1]?.tools?.map(t => t.function.name)).not.toContain("topup_credits");
+      expect(credits).not.toHaveBeenCalled();
+      expect(spawn).toHaveBeenCalledTimes(1);
+      expect(exec).not.toHaveBeenCalled();
+      expect(transfer).not.toHaveBeenCalled();
+    } finally { vi.unstubAllGlobals(); }
   });
 
   it.each(["config", "option"])("runs local Ollama without credit restrictions or topup via %s", async (source) => {

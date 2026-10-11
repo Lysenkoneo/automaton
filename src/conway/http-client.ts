@@ -10,7 +10,7 @@
 import type { HttpClientConfig } from "../types.js";
 import { DEFAULT_HTTP_CLIENT_CONFIG } from "../types.js";
 
-const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "::1"]);
+const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
 
 function assertSecureUrl(
   url: string,
@@ -82,7 +82,7 @@ export class ResilientHttpClient {
       try {
         const response = await fetch(url, {
           ...opts,
-          signal: controller.signal,
+          signal: opts.signal ? AbortSignal.any([controller.signal, opts.signal]) : controller.signal,
           headers: {
             ...opts.headers,
             ...(opts.idempotencyKey
@@ -112,6 +112,7 @@ export class ResilientHttpClient {
         return response;
       } catch (error) {
         clearTimeout(timer);
+        if (opts.signal?.aborted) throw error;
         this.consecutiveFailures++;
         if (
           this.consecutiveFailures >= this.config.circuitBreakerThreshold

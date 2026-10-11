@@ -1,3 +1,4 @@
+import { isSafeLocalTest } from "../../inference/safe-local-test.js";
 import { exec as execCb } from "node:child_process";
 import { promises as fs } from "node:fs";
 import path from "node:path";
@@ -71,6 +72,7 @@ When calling task_done, provide:
           required: ["command"],
         },
         execute: async (args) => {
+          if (isSafeLocalTest(this.context.config)) return "Blocked: system commands are disabled in safe local test mode";
           const command = args.command as string;
           const timeoutMs = Math.min(
             typeof args.timeout_ms === "number" ? args.timeout_ms : 30_000,

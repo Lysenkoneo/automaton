@@ -14,6 +14,7 @@ import type {
   TokenUsage,
   InferenceToolDefinition,
 } from "../types.js";
+import { LOCAL_MODEL, assertLocalOllamaUrl } from "../inference/local-mode.js";
 import { ResilientHttpClient } from "./http-client.js";
 
 const INFERENCE_TIMEOUT_MS = 60_000;
@@ -26,6 +27,7 @@ interface InferenceClientOptions {
   lowComputeModel?: string;
   openaiApiKey?: string;
   anthropicApiKey?: string;
+  localOnly?: boolean;
   ollamaBaseUrl?: string;
   /** Optional registry lookup — if provided, used before name heuristics */
   getModelProvider?: (modelId: string) => string | undefined;
@@ -39,7 +41,7 @@ function isLoopbackHttpUrl(url: string | undefined): boolean {
     const parsed = new URL(url);
     const host = parsed.hostname.toLowerCase();
     return parsed.protocol.toLowerCase() === "http:" &&
-      (host === "localhost" || host === "127.0.0.1" || host === "::1");
+      (host === "localhost" || host === "127.0.0.1" || host === "[::1]");
   } catch {
     return false;
   }
@@ -54,17 +56,19 @@ export function createInferenceClient(
     retryableStatuses: [429, 500, 502, 503, 504],
     allowHttpOnLoopback: isLoopbackHttpUrl(ollamaBaseUrl),
   });
-  let currentModel = options.defaultModel;
+  if (options.localOnly) assertLocalOllamaUrl(ollamaBaseUrl || "");
+  let currentModel = options.localOnly ? LOCAL_MODEL : options.defaultModel;
   let maxTokens = options.maxTokens;
 
   const chat = async (
     messages: ChatMessage[],
     opts?: InferenceOptions,
   ): Promise<InferenceResponse> => {
-    const model = opts?.model || currentModel;
+    const model = options.localOnly ? LOCAL_MODEL : opts?.model || currentModel;
     const tools = opts?.tools;
 
-    const backend = resolveInferenceBackend(model, {
+    if (options.localOnly && !ollamaBaseUrl) throw new Error("Strict local Ollama URL is missing");
+    const backend = options.localOnly ? "ollama" : resolveInferenceBackend(model, {
       openaiApiKey,
       anthropicApiKey,
       ollamaBaseUrl,
@@ -119,14 +123,21 @@ export function createInferenceClient(
       backend === "ollama" ? "ollama" :
       apiKey;
 
-    return chatViaOpenAiCompatible({
-      model,
-      body,
-      apiUrl: openAiLikeApiUrl,
-      apiKey: openAiLikeApiKey,
-      backend,
-      httpClient,
-    });
+    try {
+      return await chatViaOpenAiCompatible({
+        model,
+        body,
+        apiUrl: openAiLikeApiUrl,
+        apiKey: openAiLikeApiKey,
+        backend,
+        httpClient,
+        localOnly: options.localOnly,
+        signal: options.localOnly ? opts?.signal : undefined,
+      });
+    } catch (error) {
+      if (options.localOnly) throw new Error(`Strict local Ollama (${LOCAL_MODEL}) request failed: ${error instanceof Error ? error.message : String(error)}`);
+      throw error;
+    }
   };
 
   /**
@@ -134,6 +145,7 @@ export function createInferenceClient(
    * Still functional as a fallback; router takes priority when available.
    */
   const setLowComputeMode = (enabled: boolean): void => {
+    if (options.localOnly) return;
     if (enabled) {
       currentModel = options.lowComputeModel || "gpt-5-mini";
       maxTokens = 4096;
@@ -207,6 +219,8 @@ async function chatViaOpenAiCompatible(params: {
   apiKey: string;
   backend: "conway" | "openai" | "ollama";
   httpClient: ResilientHttpClient;
+  localOnly?: boolean;
+  signal?: AbortSignal;
 }): Promise<InferenceResponse> {
   const resp = await params.httpClient.request(`${params.apiUrl}/v1/chat/completions`, {
     method: "POST",
@@ -218,6 +232,8 @@ async function chatViaOpenAiCompatible(params: {
           : params.apiKey,
     },
     body: JSON.stringify(params.body),
+    ...(params.localOnly ? { redirect: "error" as const } : {}),
+    ...(params.signal ? { signal: params.signal } : {}),
     timeout: INFERENCE_TIMEOUT_MS,
   });
 

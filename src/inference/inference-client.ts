@@ -101,10 +101,11 @@ export class UnifiedInferenceClient {
     const survivalMode = this.isSurvivalMode();
     const candidates = this.registry.resolveCandidates(params.tier, survivalMode);
     if (candidates.length === 0) {
-      throw new Error(`No providers available for tier '${params.tier}'`);
+      throw new Error(`${this.registry.isLocalOnly() ? "Strict local Ollama unavailable: " : ""}No providers available for tier '${params.tier}'`);
     }
 
     const failedProviders: string[] = [];
+    let lastError: unknown;
     let totalRetries = 0;
 
     for (const resolved of candidates) {
@@ -130,6 +131,7 @@ export class UnifiedInferenceClient {
           throw error;
         }
 
+        lastError = error.originalError;
         totalRetries += error.retries;
         failedProviders.push(resolved.provider.id);
         this.markProviderFailure(resolved.provider.id);
@@ -143,7 +145,7 @@ export class UnifiedInferenceClient {
     }
 
     throw new Error(
-      `All providers failed for tier '${params.tier}'. Failed providers: ${failedProviders.join(", ")}`,
+      `${this.registry.isLocalOnly() ? `Strict local Ollama request failed: ${lastError instanceof Error ? lastError.message : "provider unavailable"}. ` : ""}All providers failed for tier '${params.tier}'. Failed providers: ${failedProviders.join(", ")}`,
     );
   }
 

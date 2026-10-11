@@ -51,6 +51,10 @@ export interface AutomatonConfig {
   conwayApiKey: string;
   openaiApiKey?: string;
   anthropicApiKey?: string;
+  /** Explicit local-only inference, or existing remote routing. Omitted preserves legacy behavior. */
+  inferenceMode?: "local" | "remote";
+  /** Runtime-only guard for an isolated, non-signing local test. */
+  safeLocalTest?: boolean;
   ollamaBaseUrl?: string;
   inferenceModel: string;
   maxTokensPerTurn: number;
@@ -336,6 +340,7 @@ export interface InferenceResponse {
 }
 
 export interface InferenceOptions {
+  signal?: AbortSignal;
   model?: string;
   maxTokens?: number;
   temperature?: number;

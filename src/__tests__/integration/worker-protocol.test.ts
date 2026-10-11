@@ -9,7 +9,7 @@ import { Orchestrator } from "../../orchestration/orchestrator.js";
 import { ColonyMessaging, LocalDBTransport, SocialRelayTransport, validateOutgoingTaskContent } from "../../orchestration/messaging.js";
 import { assignTask, createGoal, failTask, completeTask } from "../../orchestration/task-graph.js";
 import { TaskAttemptScope } from "../../orchestration/task-attempt.js";
-import { createTestIdentity } from "../mocks.js";
+import { createTestIdentity, createTestConfig, MockConwayClient, MockInferenceClient, MockSocialClient } from "../mocks.js";
 import { sendToChild, sendToParent } from "../../replication/messaging.js";
 import { createBuiltinTools } from "../../agent/tools.js";
 import type { AutomatonDatabase, SocialClientInterface, ToolContext } from "../../types.js";
@@ -24,6 +24,18 @@ describe("integration/worker attempt protocol", () => {
   function open(name: string, address: string) {
     const db = createDatabase(path.join(dir, name));
     db.setIdentity("address", address); databases.push(db); return db;
+  }
+  // Real tools require the full context, including configuration for safety checks.
+  // Keep this typed so future required fields cannot be bypassed by a cast.
+  function toolContext(db: AutomatonDatabase, social?: SocialClientInterface): ToolContext {
+    return {
+      db,
+      identity: createTestIdentity(),
+      config: createTestConfig({ inferenceMode: "remote" }),
+      conway: new MockConwayClient(),
+      inference: new MockInferenceClient(),
+      social,
+    };
   }
   function orchestrator(db: AutomatonDatabase, messaging: ColonyMessaging, alive = () => true) {
     const identity = createTestIdentity();
@@ -364,7 +376,7 @@ describe("integration/worker attempt protocol", () => {
     const taskId = ready(parent); const address = createTestIdentity().address;
     parent.raw.prepare("UPDATE task_graph SET status='assigned',assigned_to=?,attempt_id=NULL WHERE id=?").run(address, taskId);
     const tool = createBuiltinTools("sandbox").find((entry) => entry.name === "complete_task")!;
-    const ctx = { db: parent, identity: createTestIdentity() } as unknown as ToolContext;
+    const ctx = toolContext(parent);
     expect(await tool.execute({ task_id: taskId, output: "legacy" }, ctx)).toMatch(/Blocked/);
     const failed = insertTask(parent.raw, { goalId: getTaskById(parent.raw, taskId)!.goalId, title: "Failed", description: "Failed", status: "failed" });
     const before = parent.raw.prepare("SELECT * FROM task_graph").all();
@@ -425,7 +437,9 @@ describe("integration/worker attempt protocol", () => {
     expect(() => validateOutgoingTaskContent(JSON.stringify({ ...legacy, attemptId: "one", content: JSON.stringify({ attemptId: "two" }) }))).toThrow(/conflicting/);
     const send = vi.fn().mockResolvedValue({ id: "relay" });
     const tool = createBuiltinTools("sandbox").find((entry) => entry.name === "send_message")!;
-    const context = { social: { send } } as unknown as ToolContext;
+    const social = new MockSocialClient();
+    social.send = send;
+    const context = toolContext(child, social);
     await expect(tool.execute({ to_address: "parent", content: JSON.stringify({ ...legacy, type: "task_result" }) }, context)).rejects.toThrow(/attemptId/);
     expect(send).not.toHaveBeenCalled();
     const bound = { ...legacy, type: "task_result", attemptId: "attempt" };

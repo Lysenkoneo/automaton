@@ -163,19 +163,23 @@ export function recallProcedure(
   args: { name?: string; query?: string },
 ): string {
   try {
+    if ((args.name !== undefined && typeof args.name !== "string") || (args.query !== undefined && typeof args.query !== "string")) return "Please provide a name or query to search.";
+    const name = args.name?.trim() ? args.name : undefined;
+    const query = args.query?.trim();
+    if (!name && !query) return "Please provide a name or query to search.";
     const procedural = new ProceduralMemoryManager(db);
 
-    if (args.name) {
-      const proc = procedural.get(args.name);
-      if (!proc) return `Procedure not found: ${args.name}`;
+    if (name) {
+      const proc = procedural.get(name);
+      if (!proc) return `Procedure not found: ${name}`;
       const stepsStr = proc.steps
         .map((s) => `  ${s.order}. ${s.description}${s.tool ? ` [tool: ${s.tool}]` : ""}`)
         .join("\n");
       return `Procedure: ${proc.name}\nDescription: ${proc.description}\nSuccess: ${proc.successCount}, Failure: ${proc.failureCount}\nSteps:\n${stepsStr}`;
     }
 
-    if (args.query) {
-      const results = procedural.search(args.query);
+    if (query) {
+      const results = procedural.search(query);
       if (results.length === 0) return "No matching procedures found.";
       return results
         .map((r) => `${r.name}: ${r.description} (${r.steps.length} steps, ${r.successCount}/${r.successCount + r.failureCount} success)`)

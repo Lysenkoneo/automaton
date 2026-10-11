@@ -5,6 +5,8 @@
  * Tools are organized by category and exposed to the inference model.
  */
 
+import { isToolAllowed } from "../inference/safe-local-test.js";
+import { isStrictLocal } from "../inference/local-mode.js";
 import nodePath from "node:path";
 import { ulid } from "ulid";
 import type {
@@ -119,6 +121,16 @@ function isForbiddenCommand(command: string, sandboxId: string): string | null {
 // ─── Built-in Tools ────────────────────────────────────────────
 
 export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
+  return buildBuiltinTools(sandboxId).map(tool => ({
+    ...tool,
+    execute: async (args, context) => {
+      if (!isToolAllowed(context.config, tool)) return "Blocked: tool forbidden in strict local safety policy";
+      return tool.execute(args, context);
+    },
+  }));
+}
+
+function buildBuiltinTools(sandboxId: string): AutomatonTool[] {
   return [
     // ── VM/Sandbox Tools ──
     {
@@ -2651,18 +2663,21 @@ Model: ${ctx.inference.getDefaultModel()}
     },
     {
       name: "recall_procedure",
-      description: "Retrieve a stored procedure by exact name or search query.",
+      description: "Retrieve a stored procedure. Provide at least one non-empty name or query; never call with empty arguments.",
       category: "memory",
       riskLevel: "safe",
       parameters: {
         type: "object",
         properties: {
-          name: { type: "string", description: "Exact procedure name" },
+          name: { type: "string", minLength: 1, pattern: "\\S", description: "Exact procedure name (non-empty)" },
           query: {
             type: "string",
-            description: "Search query to find matching procedures",
+            minLength: 1,
+            pattern: "\\S",
+            description: "Non-empty search query to find matching procedures",
           },
         },
+        anyOf: [{ required: ["name"] }, { required: ["query"] }],
       },
       execute: async (args, ctx) => {
         const { recallProcedure } = await import("../memory/tools.js");
@@ -3354,6 +3369,16 @@ export async function executeTool(
       durationMs: 0,
       error: `Unknown tool: ${toolName}`,
     };
+  }
+
+  if (!isToolAllowed(context.config, tool)) return { id: ulid(), name: toolName, arguments: args, result: "", durationMs: 0, error: "Tool forbidden in strict local safety policy" };
+
+  if (isStrictLocal(context.config) && tool.category === "conway") {
+    return { id: ulid(), name: toolName, arguments: args, result: "", durationMs: 0, error: "Conway services are forbidden in strict local mode" };
+  }
+
+  if (isStrictLocal(context.config) && ["topup_credits", "transfer_credits", "fund_child", "spawn_child", "x402_fetch"].includes(toolName)) {
+    return { id: ulid(), name: toolName, arguments: args, result: "", durationMs: 0, error: "Funding and paid services are forbidden in strict local mode" };
   }
 
   // Policy evaluation (if engine is provided)

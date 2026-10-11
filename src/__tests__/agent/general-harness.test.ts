@@ -1,7 +1,7 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { GeneralHarness } from "../../agent/harnesses/general-harness.js";
 import { PolicyEngine } from "../../agent/policy-engine.js";
 import { createFinancialRules } from "../../agent/policy-rules/financial.js";
@@ -12,6 +12,8 @@ import { AgentWorkspace } from "../../orchestration/workspace.js";
 import { createDatabase } from "../../state/database.js";
 import { DEFAULT_TREASURY_POLICY } from "../../types.js";
 import { createTestConfig, createTestIdentity, MockConwayClient, MockSocialClient } from "../mocks.js";
+
+vi.mock("../../conway/x402.js", () => ({ x402Fetch: vi.fn().mockResolvedValue({ success: true, status: 200, response: "mock response" }), getUsdcBalance: vi.fn().mockResolvedValue(0) }));
 
 describe("agent/GeneralHarness", () => {
   let tempDir: string | undefined;

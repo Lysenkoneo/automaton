@@ -7,6 +7,7 @@
  * Replaces the fragile setInterval-based heartbeat.
  */
 
+import { isSafeLocalTest } from "../inference/safe-local-test.js";
 import type BetterSqlite3 from "better-sqlite3";
 import cronParser from "cron-parser";
 import type {
@@ -82,6 +83,7 @@ export class DurableScheduler {
    * Called on interval -- guards against overlap.
    */
   async tick(): Promise<void> {
+    if (isSafeLocalTest(this.legacyContext.config)) return;
     if (this.tickInProgress) return;
     this.tickInProgress = true;
 
@@ -97,6 +99,7 @@ export class DurableScheduler {
         this.legacyContext.identity.address,
         this.legacyContext.identity.chainType,
         this.legacyContext.config.ollamaBaseUrl,
+        this.legacyContext.config.inferenceMode,
       );
 
       // Get tasks that are due
@@ -173,6 +176,7 @@ export class DurableScheduler {
    * Execute a single task with timeout and lease.
    */
   async executeTask(taskName: string, ctx: TickContext): Promise<void> {
+    if (isSafeLocalTest(this.legacyContext.config)) throw new Error("Heartbeats are disabled in safe local test mode");
     const taskFn = this.tasks.get(taskName);
     if (!taskFn) return;
 

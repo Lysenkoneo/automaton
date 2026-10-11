@@ -404,6 +404,19 @@ describe("ProviderRegistry", () => {
     expect(openAiCtor).toHaveBeenCalledTimes(4);
   });
 
+
+  it("strict Ollama excludes all external candidates, including after disablement", () => {
+    const registry = createRegistryFromDefaults();
+    registry.configureLocalOllama("qwen2.5:7b", "http://localhost:11434", true);
+    for (const tier of ["reasoning", "fast", "cheap"] as const) {
+      expect(registry.resolveCandidates(tier).map(r => r.provider.id)).toEqual(["local"]);
+    }
+    expect(() => registry.getModel("openai", "gpt-4.1")).toThrow(/forbidden/);
+    expect(() => registry.overrideBaseUrl("local", "https://api.example.com/v1")).toThrow(/loopback/);
+    registry.disableProvider("local", "unavailable", 60000);
+    expect(registry.resolveCandidates("fast")).toEqual([]);
+  });
+
   it("configures a single Ollama provider for every model tier", () => {
     const registry = createRegistryFromDefaults();
     registry.configureLocalOllama("qwen2.5:7b", "http://localhost:11434/");

@@ -29,7 +29,7 @@ export class InferenceRouter {
   private registry: ModelRegistry;
   private budget: InferenceBudgetTracker;
 
-  constructor(db: Database, registry: ModelRegistry, budget: InferenceBudgetTracker) {
+  constructor(db: Database, registry: ModelRegistry, budget: InferenceBudgetTracker, private readonly localModel?: string) {
     this.db = db;
     this.registry = registry;
     this.budget = budget;
@@ -190,6 +190,14 @@ export class InferenceRouter {
    *      (free/Ollama models are allowed at any tier, including dead)
    */
   selectModel(tier: SurvivalTier, taskType: InferenceTaskType): ModelEntry | null {
+    if (this.localModel) {
+      const model = this.registry.get(this.localModel);
+      if (!model?.enabled || model.provider !== "ollama") {
+        throw new Error(`Strict local Ollama model ${this.localModel} is unavailable`);
+      }
+      return model;
+    }
+
     const TIER_ORDER: Record<string, number> = {
       dead: 0, critical: 1, low_compute: 2, normal: 3, high: 4,
     };

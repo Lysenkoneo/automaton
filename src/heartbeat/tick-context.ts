@@ -13,6 +13,7 @@ import type {
   HeartbeatConfig,
   TickContext,
 } from "../types.js";
+import { isLocalInference } from "../inference/local-mode.js";
 import { getSurvivalTier } from "../conway/credits.js";
 import { getUsdcBalance } from "../conway/x402.js";
 import { createLogger } from "../observability/logger.js";
@@ -44,17 +45,14 @@ export async function buildTickContext(
   walletAddress?: string,
   chainType?: string,
   ollamaBaseUrl?: string,
+  inferenceMode?: "local" | "remote",
 ): Promise<TickContext> {
   const tickId = generateTickId();
   const startedAt = new Date();
 
   // Fetch Conway credits only when using a non-local inference backend.
   // Ollama runs locally and does not require Conway compute credits.
-  const usingLocalOllama =
-    !!ollamaBaseUrl &&
-    /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(?::\d+)?(?:\/|$)/i.test(
-      ollamaBaseUrl,
-    );
+  const usingLocalOllama = isLocalInference({ inferenceMode, ollamaBaseUrl });
 
   let creditBalance = -1;
   if (!usingLocalOllama) {
@@ -66,7 +64,7 @@ export async function buildTickContext(
   }
 
   let usdcBalance = 0;
-  if (walletAddress) {
+  if (walletAddress && inferenceMode !== "local") {
     try {
       const network = chainType === "solana" ? "solana:mainnet" : "eip155:8453";
       usdcBalance = await getUsdcBalance(walletAddress, network, chainType as any);
